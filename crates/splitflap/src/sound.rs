@@ -44,6 +44,22 @@ pub enum Event {
     /// A bulb blowing, from -1 (left of the board) to 1 (right), at its
     /// own volume from 0 to 1.
     Pop(f32, f32),
+    /// Many flaps falling at once, more than there are voices for: a
+    /// blended clatter as loud as that many would be.
+    Crowd(Crowd),
+}
+
+/// Many flaps falling in the same moment.
+#[derive(Clone, Copy, Debug)]
+pub struct Crowd {
+    /// How many fell.
+    pub count: u32,
+    /// Where they are on average, from -1 (left) to 1 (right), and how far
+    /// apart: 0 for all in one place, 1 for right across the board.
+    pub pan: f32,
+    pub spread: f32,
+    /// The cards' height in board units.
+    pub size: f32,
 }
 
 const VOICES: usize = 64;
@@ -176,13 +192,19 @@ impl Clatter {
     }
 
     pub fn trigger(&mut self, c: Click) {
+        let v = self.click_voice(c);
+        self.take_voice(v);
+    }
+
+    /// The voice of one click.
+    fn click_voice(&mut self, c: Click) -> Voice {
         let rate = self.rate;
         // Bigger flaps ring lower and hit harder.
         let size = (c.size / 32.0).clamp(0.5, 4.0);
         let tone = size.powf(-0.35) * self.rand(0.88, 1.12) * if c.land { 0.85 } else { 1.0 };
         let gain = size.sqrt() * self.rand(0.7, 1.1) * if c.land { 1.5 } else { 1.0 };
         let angle = (c.pan.clamp(-1.0, 1.0) * 0.7 + 1.0) * std::f32::consts::FRAC_PI_4;
-        let v = Voice {
+        Voice {
             live: true,
             wait: (self.rand(0.0, 0.016) * rate) as u32,
             age: 0,
@@ -197,8 +219,7 @@ impl Clatter {
             knock_step: std::f32::consts::TAU * 240.0 * tone / rate,
             knock_decay: (-1.0 / (0.012 * rate)).exp(),
             own: false,
-        };
-        self.take_voice(v);
+        }
     }
 
     pub fn play(&mut self, e: Event) {
@@ -206,6 +227,35 @@ impl Clatter {
             Event::Click(c) => self.trigger(c),
             Event::Chime(gain) => self.chime(gain),
             Event::Pop(pan, gain) => self.pop(pan, gain),
+            Event::Crowd(c) => self.crowd(c),
+        }
+    }
+
+    /// A crowd of flaps: a few clicks spread over the moment and across the
+    /// board, each standing for several, so it sounds as busy as that many
+    /// would without taking every voice.
+    pub fn crowd(&mut self, c: Crowd) {
+        const STAND_INS: u32 = 8;
+        let n = c.count.min(STAND_INS);
+        if n == 0 {
+            return;
+        }
+        // Clicks that land at random add up as the square root of how many.
+        let each = (c.count as f32 / n as f32).sqrt();
+        for _ in 0..n {
+            let pan = c.pan + c.spread * self.rand(-1.0, 1.0);
+            let land = self.rand(0.0, 1.0) < 0.2;
+            let mut v = self.click_voice(Click {
+                pan,
+                size: c.size,
+                land,
+            });
+            // Louder for the clicks it stands for, and spread a little
+            // further in time.
+            v.left *= each;
+            v.right *= each;
+            v.wait += (self.rand(0.0, 0.03) * self.rate) as u32;
+            self.take_voice(v);
         }
     }
 
@@ -416,6 +466,11 @@ impl Sound {
         let _ = self.events.push(Event::Pop(pan, gain(volume)));
     }
 
+    /// Many clicks at once; see [`Event::Crowd`].
+    pub fn crowd(&mut self, c: Crowd) {
+        let _ = self.events.push(Event::Crowd(c));
+    }
+
     /// Rings the alarm chime once, at `volume` from 0 to 1.
     pub fn chime(&mut self, volume: f32) {
         let _ = self.events.push(Event::Chime(gain(volume)));
@@ -514,6 +569,26 @@ mod tests {
         let mut out = vec![0.0; 2 * 4410];
         c.render(&mut out, 1.0);
         assert!(out.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
+    }
+
+    #[test]
+    fn a_crowd_is_louder_than_one_click_and_stays_in_range() {
+        let level = |count: u32| {
+            let mut c = Clatter::new(48_000.0, Rng::with_seed(4));
+            c.crowd(Crowd {
+                count,
+                pan: 0.0,
+                spread: 0.8,
+                size: 32.0,
+            });
+            let mut out = vec![0.0; 2 * 48_000 / 5];
+            c.render(&mut out, 1.0);
+            assert!(out.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
+            out.iter().map(|x| x * x).sum::<f32>()
+        };
+        assert!(level(400) > level(8) * 3.0);
+        assert!(level(8) > 0.0);
+        assert_eq!(level(0), 0.0);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/splitflap"]
+members = ["crates/splitflap", "crates/now-boarding"]
 resolver = "2"
 
 [workspace.package]

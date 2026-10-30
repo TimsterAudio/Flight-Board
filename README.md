@@ -4,10 +4,17 @@ A live airport and railway departures and arrivals board, drawn with
 split-flap cards: *Flight Board* or *Train Board*. Windows and Linux; Mac
 later. The design brief is [docs/BRIEF.md](docs/BRIEF.md).
 
-Work in progress: Phases 0 and 1 of the brief's build plan.
+Work in progress: Phases 0 to 2 of the brief's build plan; see
+[TODO.md](TODO.md).
+
+    cargo run --release -p now-boarding
+
+runs the board on its demo feed: no key, no network. Right-click or
+double-click it for Settings.
 
 ## What's here
 
+- `crates/now-boarding`: the app. See [docs/PHASE2.md](docs/PHASE2.md).
 - `crates/splitflap`: the split-flap look shared with
   [Split-Flap Clock](https://github.com/TimsterAudio/SplitFlap_Clock). It holds
   the cards and their drums (letters, times, and word flaps for remarks), text

@@ -109,6 +109,9 @@ pub struct Row {
     pub tiles: Vec<Option<(Color32, Color32)>>,
     /// A lit tab at the end of the row, as beside a remark that matters.
     pub tab: Option<Color32>,
+    /// A column whose cards have a lamp lit round them, as when a gate or
+    /// platform changes.
+    pub mark: Option<(usize, Color32)>,
 }
 
 impl Row {
@@ -126,6 +129,12 @@ impl Row {
 
     pub fn tab(mut self, tab: Color32) -> Self {
         self.tab = Some(tab);
+        self
+    }
+
+    /// Lights a lamp round column `col`'s cards.
+    pub fn mark(mut self, col: usize, colour: Color32) -> Self {
+        self.mark = Some((col, colour));
         self
     }
 
@@ -173,6 +182,8 @@ pub struct Board {
     columns: Vec<Column>,
     lines: Vec<Line>,
     card: Vec2,
+    /// Room at the end of each row for a lit tab.
+    tabs: bool,
     rng: Rng,
     cache: RefCell<Cache>,
 }
@@ -185,9 +196,11 @@ impl Board {
             columns,
             lines: Vec::new(),
             card: CARD,
+            tabs: false,
             rng,
             cache: RefCell::default(),
         };
+        b.tabs = b.columns.iter().any(Column::wide);
         b.set_row_count(rows, now);
         b
     }
@@ -335,7 +348,14 @@ impl Board {
     }
 
     fn has_tabs(&self) -> bool {
-        self.columns.iter().any(Column::wide)
+        self.tabs
+    }
+
+    /// Room at the end of each row for a lit tab, or none. A board with a
+    /// word flap has it to begin with.
+    pub fn with_tabs(mut self, tabs: bool) -> Self {
+        self.tabs = tabs;
+        self
     }
 
     /// The board's size in board units.
@@ -469,6 +489,44 @@ impl Board {
         painter.add(still);
         for (f, r, look) in by_hand {
             f.draw(ctx, painter, r, &font, &look);
+        }
+        // Lamps lit round cells.
+        let mut row_y = if self.has_captions() { CAPTIONS } else { 0.0 };
+        for line in &self.lines {
+            if let Some((col, colour)) = line.row.mark {
+                if col < self.columns.len() {
+                    let x: f32 = self.columns[..col]
+                        .iter()
+                        .map(|c| c.width(self.card) + self.card.y * COLUMN_GAP)
+                        .sum();
+                    let pad = self.card.y * 0.1;
+                    let r = Rect::from_min_size(
+                        u(x - pad, row_y - pad),
+                        vec2(
+                            self.columns[col].width(self.card) + 2.0 * pad,
+                            self.card.y + 2.0 * pad,
+                        ) * scale,
+                    );
+                    painter.add(crate::lighting::halo(
+                        r.center(),
+                        r.width() * 0.75,
+                        r.height() * 1.1,
+                        Color32::from_rgba_premultiplied(
+                            colour.r() / 4,
+                            colour.g() / 4,
+                            colour.b() / 4,
+                            0,
+                        ),
+                    ));
+                    painter.rect_stroke(
+                        r,
+                        2.0 * scale,
+                        egui::Stroke::new(1.5 * scale, colour),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+            row_y += self.card.y * (1.0 + ROW_GAP);
         }
         // The lit tabs, beside the remarks.
         let mut y = if self.has_captions() { CAPTIONS } else { 0.0 };
