@@ -1,0 +1,2373 @@
+Moves Split-Flap Clock 1.2.0 onto the splitflap crate: the clock's flap.rs,
+sound.rs, lighting.rs and rng.rs are removed and taken from the crate, pinned
+to a commit of TimsterAudio/Flight-Board. In the clock repo:
+
+    git apply docs/clock-on-splitflap.patch    (this file)
+    cargo build                                (updates Cargo.lock)
+
+If Flight-Board is private, the clock's CI needs read access to it to fetch
+the crate.
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 86e3359..e887c08 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,8 +17,7 @@ chrono-tz = "0.10"
+ iana-time-zone = "0.1"
+ serde = { version = "1", features = ["derive"] }
+ raw-window-handle = "0.6"
+-cpal = "0.18"
+-rtrb = "0.4"
++splitflap = { git = "https://github.com/TimsterAudio/Flight-Board", rev = "b3438e5c23fa2dd15b35144298e62e59709d60b6" }
+ 
+ [target.'cfg(target_os = "linux")'.dependencies]
+ winit = { version = "0.30", default-features = false, features = ["x11"] }
+diff --git a/src/flap.rs b/src/flap.rs
+deleted file mode 100644
+index 8c9b138..0000000
+--- a/src/flap.rs
++++ /dev/null
+@@ -1,631 +0,0 @@
+-//! One split-flap card: what it shows, how it steps between symbols, and how
+-//! it is drawn.
+-//!
+-//! A real card sits on a drum of flaps and can only move forward, one flap at
+-//! a time. Each card here has a drum too, so a change from `B` to `F` flips
+-//! through `C`, `D` and `E` on the way, quickly, and the last flip lands at
+-//! normal speed.
+-
+-use std::collections::VecDeque;
+-use std::f32::consts::PI;
+-
+-use egui::epaint::{ClippedShape, PathShape, Primitive};
+-use egui::{
+-    pos2, vec2, Color32, Context, CornerRadius, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke,
+-};
+-
+-/// The duration of a flip that lands on the wanted symbol, in seconds.
+-const FLIP: f64 = 0.30;
+-/// The duration of a flip on the way to it.
+-const FAST: f64 = 0.07;
+-
+-const ALPHA: &str = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-+:/'&,()";
+-
+-/// The sky card's flaps, which are pictures rather than letters.
+-pub const MORNING: &str = "<morning>";
+-pub const DAY: &str = "<day>";
+-pub const EVENING: &str = "<evening>";
+-pub const NIGHT: &str = "<night>";
+-
+-/// The symbols a card can show, in the order they come round.
+-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+-pub enum Drum {
+-    /// 0 to 9: the units of hours, minutes and seconds.
+-    Digit,
+-    /// 0 to 5: the tens of minutes and seconds.
+-    Tens6,
+-    /// 0 to 2: the tens of hours on a 24-hour clock.
+-    Tens3,
+-    /// Blank or 1: the tens of hours on a 12-hour clock.
+-    Tens12,
+-    /// AM and PM.
+-    AmPm,
+-    /// Letters, digits and a little punctuation, for names and dates.
+-    Alpha,
+-    /// The sky: night, morning, day and evening, in the order a day goes.
+-    Sky,
+-}
+-
+-impl Drum {
+-    fn len(self) -> usize {
+-        match self {
+-            Drum::Digit => 10,
+-            Drum::Tens6 => 6,
+-            Drum::Tens3 => 3,
+-            Drum::Tens12 => 2,
+-            Drum::AmPm => 2,
+-            Drum::Alpha => ALPHA.len(),
+-            Drum::Sky => 4,
+-        }
+-    }
+-
+-    fn symbol(self, i: usize) -> &'static str {
+-        match self {
+-            Drum::Digit => &"0123456789"[i..=i],
+-            Drum::Tens6 => &"012345"[i..=i],
+-            Drum::Tens3 => &"012"[i..=i],
+-            Drum::Tens12 => &" 1"[i..=i],
+-            Drum::AmPm => ["AM", "PM"][i],
+-            Drum::Alpha => &ALPHA[i..=i],
+-            Drum::Sky => [NIGHT, MORNING, DAY, EVENING][i],
+-        }
+-    }
+-
+-    fn index(self, s: &str) -> Option<usize> {
+-        (0..self.len()).find(|&i| self.symbol(i) == s)
+-    }
+-
+-    /// The flaps that come round on the way from `from` to `to`, ending with
+-    /// `to`. A symbol the drum doesn't have is reached in one flip.
+-    pub fn steps(self, from: &str, to: &str) -> Vec<String> {
+-        let Some(b) = self.index(to) else {
+-            return vec![to.to_string()];
+-        };
+-        // A card that shows something off the drum (a blank digit card when
+-        // the clock starts) comes round from the drum's first flap.
+-        let mut i = match self.index(from) {
+-            Some(a) if a == b => return Vec::new(),
+-            Some(a) => (a + 1) % self.len(),
+-            None => 0,
+-        };
+-        let mut out = Vec::new();
+-        loop {
+-            out.push(self.symbol(i).to_string());
+-            if i == b {
+-                return out;
+-            }
+-            i = (i + 1) % self.len();
+-        }
+-    }
+-
+-    /// One whole turn of the drum from `from`, then on to `to`: what a
+-    /// card does when the board refreshes.
+-    pub fn turn(self, from: &str, to: &str) -> Vec<String> {
+-        let mut out = Vec::new();
+-        if let Some(a) = self.index(from) {
+-            out.extend((1..=self.len()).map(|k| self.symbol((a + k) % self.len()).to_string()));
+-        }
+-        out.extend(self.steps(from, to));
+-        out
+-    }
+-}
+-
+-/// The colours a card is drawn in.
+-#[derive(Clone, Copy)]
+-pub struct Look {
+-    pub top: Color32,
+-    pub bottom: Color32,
+-    pub split: Color32,
+-    pub hinge: Color32,
+-    pub ink: Color32,
+-}
+-
+-/// A flap that has just fallen, for the sound.
+-#[derive(Clone, Copy, Debug)]
+-pub struct Fall {
+-    /// The last flip, onto the symbol the card was after.
+-    pub land: bool,
+-    /// Part of a start-up or a refresh, rather than the time moving on.
+-    pub show: bool,
+-}
+-
+-pub struct Flap {
+-    drum: Drum,
+-    /// What the card showed before the flip under way.
+-    prev: String,
+-    /// What the flip under way lands on.
+-    cur: String,
+-    /// What the card is on its way to.
+-    target: String,
+-    queue: VecDeque<String>,
+-    start: f64,
+-    dur: f64,
+-    /// No flipping before this time, so cards set off a moment apart.
+-    hold: f64,
+-    /// How long this card's quick flips take, as a share of the usual: no
+-    /// two mechanisms on a real board run at quite the same speed.
+-    pace: f64,
+-    /// Whether the flips under way are a start-up or a refresh.
+-    show: bool,
+-}
+-
+-impl Flap {
+-    /// A blank card that starts flipping `delay` seconds after `now`, its
+-    /// quick flips taking `pace` times as long as usual.
+-    pub fn new(drum: Drum, now: f64, delay: f64, pace: f64) -> Self {
+-        Self {
+-            drum,
+-            prev: " ".into(),
+-            cur: " ".into(),
+-            target: " ".into(),
+-            queue: VecDeque::new(),
+-            start: 0.0,
+-            dur: 0.0,
+-            hold: now + delay,
+-            pace,
+-            show: true,
+-        }
+-    }
+-
+-    pub fn drum(&self) -> Drum {
+-        self.drum
+-    }
+-
+-    pub fn set(&mut self, target: &str) {
+-        if self.target == target {
+-            return;
+-        }
+-        self.target = target.to_string();
+-        self.queue = self.drum.steps(&self.cur, target).into();
+-        self.pace = 1.0;
+-    }
+-
+-    /// Spins the card once round its drum, starting `delay` seconds after
+-    /// `now` with its quick flips taking `pace` times as long as usual, and
+-    /// lands it on `target`.
+-    pub fn turn(&mut self, target: &str, now: f64, delay: f64, pace: f64) {
+-        self.target = target.to_string();
+-        self.queue = self.drum.turn(&self.cur, target).into();
+-        self.hold = self.hold.max(now + delay);
+-        self.pace = pace;
+-        self.show = true;
+-    }
+-
+-    fn progress(&self, now: f64) -> f32 {
+-        if self.dur <= 0.0 {
+-            1.0
+-        } else {
+-            ((now - self.start) / self.dur).clamp(0.0, 1.0) as f32
+-        }
+-    }
+-
+-    /// Moves the card on to its next flap when the current flip is done,
+-    /// and says so. `speed` is how fast flaps fall, 1 being the usual.
+-    pub fn tick(&mut self, now: f64, speed: f64) -> Option<Fall> {
+-        if now < self.hold || self.progress(now) < 1.0 {
+-            return None;
+-        }
+-        let next = self.queue.pop_front()?;
+-        self.prev = std::mem::replace(&mut self.cur, next);
+-        self.start = now;
+-        let land = self.queue.is_empty();
+-        self.dur = if land { FLIP } else { FAST * self.pace } / speed.max(0.05);
+-        let fall = Fall {
+-            land,
+-            show: self.show,
+-        };
+-        if land {
+-            // From here on, changes are just the time moving on.
+-            self.show = false;
+-        }
+-        Some(fall)
+-    }
+-
+-    pub fn busy(&self, now: f64) -> bool {
+-        !self.queue.is_empty() || self.progress(now) < 1.0
+-    }
+-
+-    pub fn draw(&self, ctx: &Context, painter: &Painter, rect: Rect, font: &FontId, look: &Look) {
+-        let now = ctx.input(|i| i.time);
+-        let p = self.progress(now);
+-        let flipping = p < 1.0;
+-
+-        let h = rect.height();
+-        let r = (h * 0.07).round().max(1.0) as u8;
+-        let gap = (h * 0.025).max(1.0);
+-        let mid = rect.center().y;
+-        let top = Rect::from_min_max(rect.min, pos2(rect.max.x, mid - gap / 2.0));
+-        let bottom = Rect::from_min_max(pos2(rect.min.x, mid + gap / 2.0), rect.max);
+-        let top_r = CornerRadius {
+-            nw: r,
+-            ne: r,
+-            sw: 0,
+-            se: 0,
+-        };
+-        let bottom_r = CornerRadius {
+-            nw: 0,
+-            ne: 0,
+-            sw: r,
+-            se: r,
+-        };
+-
+-        // The split, and the card's halves behind any moving flap: the new
+-        // symbol's top is already showing; the old one's bottom stays until
+-        // the flap lands on it.
+-        painter.rect_filled(rect.shrink2(egui::vec2(0.0, h * 0.02)), r, look.split);
+-        painter.rect_filled(top, top_r, look.top);
+-        painter.rect_filled(bottom, bottom_r, look.bottom);
+-        let under = if flipping { &self.prev } else { &self.cur };
+-        painter
+-            .with_clip_rect(top.intersect(painter.clip_rect()))
+-            .add(glyph(painter, rect, &self.cur, font, look.ink));
+-        painter
+-            .with_clip_rect(bottom.intersect(painter.clip_rect()))
+-            .add(glyph(painter, rect, under, font, look.ink));
+-
+-        if flipping {
+-            if p < 0.5 {
+-                // The old top folds down towards the hinge, darkening as it
+-                // turns away from the light, and shades the half below it.
+-                let s = (PI * p).cos();
+-                let hinge = top.max.y;
+-                let flap = Rect::from_min_max(pos2(top.min.x, hinge - top.height() * s), top.max);
+-                let shade = 0.45 + 0.55 * s;
+-                painter.rect_filled(
+-                    bottom,
+-                    bottom_r,
+-                    Color32::from_black_alpha((70.0 * (1.0 - s)) as u8),
+-                );
+-                painter.rect_filled(flap, top_r, darken(look.top, shade));
+-                squashed(
+-                    ctx,
+-                    &painter.with_clip_rect(flap.intersect(painter.clip_rect())),
+-                    glyph(painter, rect, &self.prev, font, look.ink),
+-                    hinge,
+-                    s,
+-                    shade,
+-                );
+-            } else {
+-                // The new bottom swings down from the hinge.
+-                let s = -(PI * p).cos();
+-                let hinge = bottom.min.y;
+-                let flap =
+-                    Rect::from_min_max(bottom.min, pos2(bottom.max.x, hinge + bottom.height() * s));
+-                let shade = 0.6 + 0.4 * s;
+-                painter.rect_filled(flap, bottom_r, darken(look.bottom, shade));
+-                squashed(
+-                    ctx,
+-                    &painter.with_clip_rect(flap.intersect(painter.clip_rect())),
+-                    glyph(painter, rect, &self.cur, font, look.ink),
+-                    hinge,
+-                    s,
+-                    shade,
+-                );
+-            }
+-        }
+-
+-        // The pins the flaps hang on.
+-        let pin = egui::vec2((rect.width() * 0.05).max(1.5), gap * 2.6);
+-        for x in [rect.min.x + pin.x / 2.0, rect.max.x - pin.x / 2.0] {
+-            painter.rect_filled(Rect::from_center_size(pos2(x, mid), pin), 1.0, look.hinge);
+-        }
+-    }
+-}
+-
+-/// `text` centred on the card, with every symbol on the same baseline.
+-fn glyph(painter: &Painter, card: Rect, text: &str, font: &FontId, ink: Color32) -> Shape {
+-    if let Some(picture) = picture(card, text, ink) {
+-        return picture;
+-    }
+-    let galley = painter.layout_no_wrap(text.to_string(), font.clone(), ink);
+-    // Centre on the ink of a digit rather than on the line, which has room
+-    // for descenders below.
+-    let reference = painter.layout_no_wrap("0".into(), font.clone(), ink);
+-    let ink_mid = reference
+-        .rows
+-        .first()
+-        .map(|row| row.pos.y + row.visuals.mesh_bounds.center().y)
+-        .unwrap_or(reference.size().y / 2.0);
+-    let pos = pos2(
+-        card.center().x - galley.size().x / 2.0,
+-        card.center().y - ink_mid,
+-    );
+-    Shape::galley(pos, galley, ink)
+-}
+-
+-/// The sky card's pictures, solid in the card's ink: the sun rising over the
+-/// horizon, the sun, the sun setting into the sea, and the moon and stars.
+-fn picture(card: Rect, text: &str, ink: Color32) -> Option<Shape> {
+-    let c = card.center();
+-    // Half the picture's size.
+-    let u = (card.width() * 0.9).min(card.height() * 0.64) / 2.0;
+-    let line = Stroke::new(u * 0.13, ink);
+-    let ray = |centre: Pos2, angle: f32, from: f32, to: f32| {
+-        let d = vec2(angle.cos(), angle.sin());
+-        Shape::line_segment([centre + d * from, centre + d * to], line)
+-    };
+-    let mut shapes = Vec::new();
+-    match text {
+-        DAY => {
+-            shapes.push(Shape::circle_filled(c, u * 0.5, ink));
+-            for k in 0..8 {
+-                shapes.push(ray(c, k as f32 * PI / 4.0, u * 0.7, u * 0.98));
+-            }
+-        }
+-        MORNING => {
+-            let horizon = c.y + u * 0.3;
+-            let sun = pos2(c.x, horizon);
+-            shapes.push(Shape::convex_polygon(
+-                half_disc(sun, u * 0.55),
+-                ink,
+-                Stroke::NONE,
+-            ));
+-            for k in 0..5 {
+-                let a = PI + PI * (k as f32 + 1.0) / 6.0;
+-                shapes.push(ray(sun, a, u * 0.72, u * 0.98));
+-            }
+-            let h = |y: f32, half: f32| {
+-                Shape::line_segment([pos2(c.x - half, y), pos2(c.x + half, y)], line)
+-            };
+-            shapes.push(h(horizon + u * 0.08, u * 0.98));
+-            shapes.push(h(horizon + u * 0.36, u * 0.6));
+-        }
+-        EVENING => {
+-            let r = u * 0.78;
+-            shapes.push(Shape::convex_polygon(half_disc(c, r), ink, Stroke::NONE));
+-            // The lower half, sinking: bars across it, as the chords there.
+-            for dy in [0.2, 0.46, 0.72] {
+-                let y = c.y + r * dy;
+-                let half = (r * r - (r * dy) * (r * dy)).sqrt();
+-                shapes.push(Shape::line_segment(
+-                    [pos2(c.x - half, y), pos2(c.x + half, y)],
+-                    line,
+-                ));
+-            }
+-        }
+-        NIGHT => {
+-            shapes.push(crescent(c + vec2(-u * 0.12, u * 0.05), u * 0.72, ink));
+-            shapes.push(star(c + vec2(u * 0.6, -u * 0.58), u * 0.24, ink));
+-            shapes.push(star(c + vec2(u * 0.78, u * 0.06), u * 0.16, ink));
+-        }
+-        _ => return None,
+-    }
+-    Some(Shape::Vec(shapes))
+-}
+-
+-/// The top half of a disc, as a polygon.
+-fn half_disc(centre: Pos2, r: f32) -> Vec<Pos2> {
+-    (0..=24)
+-        .map(|k| {
+-            let a = PI + PI * k as f32 / 24.0;
+-            centre + vec2(a.cos(), a.sin()) * r
+-        })
+-        .collect()
+-}
+-
+-/// A crescent moon: a disc of radius `r` at `centre` with a bite out of its
+-/// upper right, filled as a strip between its two edges, and outlined so
+-/// the edges are smooth.
+-fn crescent(centre: Pos2, r: f32, ink: Color32) -> Shape {
+-    let bite = centre + vec2(r * 0.42, -r * 0.3);
+-    let br = r * 0.82;
+-    // The tips, where the two circles cross, as angles round each circle.
+-    let d = (bite - centre).length();
+-    let a = (r * r - br * br + d * d) / (2.0 * d);
+-    let h = (r * r - a * a).max(0.0).sqrt();
+-    let along = (bite - centre) / d;
+-    let mid = centre + along * a;
+-    let across = vec2(-along.y, along.x);
+-    let (t1, t2) = (mid + across * h, mid - across * h);
+-    let angle = |o: Pos2, p: Pos2| (p.y - o.y).atan2(p.x - o.x);
+-    // The outer edge goes the long way round, away from the bite; the inner
+-    // edge the short way, inside the moon.
+-    let o1 = angle(centre, t1);
+-    let o2 = arc_through(o1, angle(centre, t2), angle(centre, bite) + PI);
+-    let i1 = angle(bite, t1);
+-    let i2 = arc_through(i1, angle(bite, t2), angle(bite, centre));
+-    const N: usize = 28;
+-    let point = |o: Pos2, rr: f32, a: f32| o + vec2(a.cos(), a.sin()) * rr;
+-    let outer: Vec<Pos2> = (0..=N)
+-        .map(|k| point(centre, r, o1 + (o2 - o1) * k as f32 / N as f32))
+-        .collect();
+-    let inner: Vec<Pos2> = (0..=N)
+-        .map(|k| point(bite, br, i1 + (i2 - i1) * k as f32 / N as f32))
+-        .collect();
+-    let mut mesh = Mesh::default();
+-    for k in 0..=N {
+-        mesh.colored_vertex(outer[k], ink);
+-        mesh.colored_vertex(inner[k], ink);
+-    }
+-    for k in 0..N as u32 {
+-        let (a, b, c, d) = (2 * k, 2 * k + 1, 2 * k + 2, 2 * k + 3);
+-        mesh.add_triangle(a, b, c);
+-        mesh.add_triangle(b, d, c);
+-    }
+-    let mut edge = outer;
+-    edge.extend(inner.into_iter().rev());
+-    Shape::Vec(vec![
+-        Shape::mesh(mesh),
+-        Shape::Path(PathShape::closed_line(edge, Stroke::new(r * 0.04, ink))),
+-    ])
+-}
+-
+-/// The angle to go round to from `a` to reach `b`, by whichever way round
+-/// passes `via`: `b` itself, or `b` a whole turn off, so that going from `a`
+-/// to the result in a straight line of angles takes that way.
+-fn arc_through(a: f32, b: f32, via: f32) -> f32 {
+-    let turn = 2.0 * PI;
+-    let forward = (b - a).rem_euclid(turn);
+-    if (via - a).rem_euclid(turn) <= forward {
+-        a + forward
+-    } else {
+-        a - (turn - forward)
+-    }
+-}
+-
+-/// A four-pointed twinkle of radius `r`.
+-fn star(centre: Pos2, r: f32, ink: Color32) -> Shape {
+-    let points: Vec<Pos2> = (0..8)
+-        .map(|k| {
+-            let a = k as f32 * PI / 4.0 - PI / 2.0;
+-            let rr = if k % 2 == 0 { r } else { r * 0.32 };
+-            centre + vec2(a.cos(), a.sin()) * rr
+-        })
+-        .collect();
+-    let mut mesh = Mesh::default();
+-    mesh.colored_vertex(centre, ink);
+-    for p in &points {
+-        mesh.colored_vertex(*p, ink);
+-    }
+-    for k in 0..8u32 {
+-        mesh.add_triangle(0, 1 + k, 1 + (k + 1) % 8);
+-    }
+-    Shape::Vec(vec![
+-        Shape::mesh(mesh),
+-        Shape::Path(PathShape::closed_line(points, Stroke::new(r * 0.08, ink))),
+-    ])
+-}
+-
+-/// Draws `shape` squashed towards the line at `hinge` by `s`, as a flap
+-/// seen turning edge-on.
+-fn squashed(ctx: &Context, painter: &Painter, shape: Shape, hinge: f32, s: f32, shade: f32) {
+-    let clipped = ClippedShape {
+-        clip_rect: Rect::EVERYTHING,
+-        shape,
+-    };
+-    for prim in ctx.tessellate(vec![clipped], ctx.pixels_per_point()) {
+-        if let Primitive::Mesh(mut mesh) = prim.primitive {
+-            for v in &mut mesh.vertices {
+-                v.pos.y = hinge + (v.pos.y - hinge) * s;
+-                v.color = darken(v.color, shade);
+-            }
+-            painter.add(Shape::mesh(mesh));
+-        }
+-    }
+-}
+-
+-fn darken(c: Color32, k: f32) -> Color32 {
+-    let f = |x: u8| (x as f32 * k).round() as u8;
+-    Color32::from_rgba_premultiplied(f(c.r()), f(c.g()), f(c.b()), c.a())
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn steps_go_forward_and_wrap() {
+-        assert_eq!(Drum::Digit.steps("3", "4"), ["4"]);
+-        assert_eq!(Drum::Digit.steps("9", "0"), ["0"]);
+-        assert_eq!(Drum::Tens6.steps("5", "0"), ["0"]);
+-        assert_eq!(Drum::Alpha.steps("B", "E"), ["C", "D", "E"]);
+-        assert!(Drum::Digit.steps("7", "7").is_empty());
+-    }
+-
+-    #[test]
+-    fn a_refresh_turns_the_whole_drum() {
+-        assert_eq!(Drum::Tens3.turn("1", "1"), ["2", "0", "1"]);
+-        assert_eq!(Drum::Tens3.turn("1", "2"), ["2", "0", "1", "2"]);
+-        assert_eq!(Drum::Alpha.turn("A", "A").len(), Drum::Alpha.len());
+-        // A card that is still blank just comes round to its symbol.
+-        assert_eq!(Drum::Digit.turn(" ", "1"), ["0", "1"]);
+-    }
+-
+-    #[test]
+-    fn only_start_ups_and_refreshes_are_shows() {
+-        let mut f = Flap::new(Drum::Digit, 0.0, 0.0, 1.0);
+-        f.set("1");
+-        let mut falls = Vec::new();
+-        let mut t = 0.0;
+-        for _ in 0..200 {
+-            falls.extend(f.tick(t, 1.0));
+-            t += 0.01;
+-        }
+-        // Blank to 0, then 1.
+-        assert_eq!(falls.len(), 2);
+-        assert!(falls.iter().all(|f| f.show));
+-        assert!(falls[1].land && !falls[0].land);
+-        // The time moving on is not a show.
+-        f.set("2");
+-        let fall = (0..100).find_map(|_| {
+-            t += 0.01;
+-            f.tick(t, 1.0)
+-        });
+-        assert!(fall.is_some_and(|f| !f.show && f.land));
+-        // A refresh is.
+-        f.turn("2", t, 0.0, 1.0);
+-        t += 1.0;
+-        assert!(f.tick(t, 1.0).is_some_and(|f| f.show));
+-    }
+-
+-    #[test]
+-    fn arcs_go_the_way_round_asked() {
+-        // From 0 to a quarter turn, the short way and the long way.
+-        assert!((arc_through(0.0, PI / 2.0, PI / 4.0) - PI / 2.0).abs() < 1e-5);
+-        assert!((arc_through(0.0, PI / 2.0, PI) - (PI / 2.0 - 2.0 * PI)).abs() < 1e-5);
+-    }
+-
+-    #[test]
+-    fn the_sky_goes_round_in_the_order_of_a_day() {
+-        assert_eq!(Drum::Sky.steps(NIGHT, MORNING), [MORNING]);
+-        assert_eq!(Drum::Sky.steps(EVENING, NIGHT), [NIGHT]);
+-        assert_eq!(Drum::Sky.turn(DAY, DAY), [EVENING, NIGHT, MORNING, DAY]);
+-        let card = Rect::from_min_size(pos2(0.0, 0.0), vec2(30.0, 32.0));
+-        for s in [MORNING, DAY, EVENING, NIGHT] {
+-            assert!(picture(card, s, Color32::WHITE).is_some());
+-        }
+-        assert!(picture(card, "A", Color32::WHITE).is_none());
+-    }
+-
+-    #[test]
+-    fn the_flip_speed_scales_the_flips() {
+-        // How long a card takes from A to Z at a speed.
+-        let took = |speed: f64| {
+-            let mut f = Flap::new(Drum::Alpha, 0.0, 0.0, 1.0);
+-            f.set("A");
+-            let mut t = 0.0;
+-            while f.busy(t) || t == 0.0 {
+-                f.tick(t, 1.0);
+-                t += 0.001;
+-            }
+-            let from = t;
+-            f.set("Z");
+-            while f.busy(t) {
+-                f.tick(t, speed);
+-                t += 0.001;
+-            }
+-            t - from
+-        };
+-        let normal = took(1.0);
+-        assert!(
+-            (took(2.0) / normal - 0.5).abs() < 0.05,
+-            "{}",
+-            took(2.0) / normal
+-        );
+-        assert!((took(0.5) / normal - 2.0).abs() < 0.1);
+-    }
+-
+-    #[test]
+-    fn a_blank_card_comes_round_from_the_start() {
+-        assert_eq!(Drum::Digit.steps(" ", "2"), ["0", "1", "2"]);
+-        assert_eq!(Drum::AmPm.steps(" ", "PM"), ["AM", "PM"]);
+-    }
+-
+-    #[test]
+-    fn symbols_off_the_drum_take_one_flip() {
+-        assert_eq!(Drum::Alpha.steps("A", "é"), ["é"]);
+-    }
+-
+-    #[test]
+-    fn a_card_lands_on_its_target() {
+-        let mut f = Flap::new(Drum::Alpha, 0.0, 0.0, 1.0);
+-        f.set("C");
+-        let mut t = 0.0;
+-        while f.busy(t) || t == 0.0 {
+-            f.tick(t, 1.0);
+-            t += 0.01;
+-            assert!(t < 5.0);
+-        }
+-        assert_eq!(f.cur, "C");
+-    }
+-}
+diff --git a/src/lighting.rs b/src/lighting.rs
+deleted file mode 100644
+index b092f62..0000000
+--- a/src/lighting.rs
++++ /dev/null
+@@ -1,950 +0,0 @@
+-//! The board's lighting: a row of incandescent lamps just above it, each
+-//! throwing a warm pool of light down the board, brightest near the top and
+-//! fading away below. Once in a while, a bulb flickers, then either comes
+-//! good or blows: a flash and a pop, a wisp of smoke, and its glass falling
+-//! to the foot of the board, its part of the board in shadow until it's
+-//! replaced: after a while by itself, or by hand, by clicking it; and the
+-//! janitor comes along the foot of the board with a broom and sweeps the
+-//! glass off the nearer end.
+-//!
+-//! The light is drawn over the finished board: a fine grid, darkened where
+-//! the lamps don't reach and warmed where they do, so it falls on the cards,
+-//! their letters and the board alike.
+-
+-use egui::{pos2, Color32, Mesh, Painter, Pos2, Rect};
+-use serde::{Deserialize, Serialize};
+-
+-use crate::rng::Rng;
+-
+-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+-pub enum Mood {
+-    /// No lamps: the board evenly lit, as it always was.
+-    #[default]
+-    Off,
+-    /// A gentle warm wash.
+-    Soft,
+-    /// Warm pools under each lamp.
+-    Warm,
+-    /// A dim hall, the lamps doing all the work.
+-    Evening,
+-}
+-
+-impl Mood {
+-    /// How the mood lights the board.
+-    fn look(self) -> Option<MoodLook> {
+-        let warm = [1.0, 0.72, 0.42];
+-        match self {
+-            Mood::Off => None,
+-            Mood::Soft => Some(MoodLook {
+-                ambient: 0.8,
+-                lamp: 0.3,
+-                glow: 0.06,
+-                tint: warm,
+-                shadow: 0.45,
+-            }),
+-            Mood::Warm => Some(MoodLook {
+-                ambient: 0.58,
+-                lamp: 0.5,
+-                glow: 0.1,
+-                tint: warm,
+-                shadow: 0.6,
+-            }),
+-            Mood::Evening => Some(MoodLook {
+-                ambient: 0.32,
+-                lamp: 0.75,
+-                glow: 0.13,
+-                tint: [1.0, 0.64, 0.34],
+-                shadow: 0.75,
+-            }),
+-        }
+-    }
+-
+-    /// How dark the cards' shadows on the board are, 0 for none.
+-    pub fn shadow(self) -> f32 {
+-        self.look().map_or(0.0, |l| l.shadow)
+-    }
+-}
+-
+-const DAY: f64 = 24.0 * 3600.0;
+-
+-/// How far the dimmer turns the lamps down, and up.
+-pub const DIMMEST: f32 = 0.25;
+-pub const BRIGHTEST: f32 = 1.6;
+-
+-/// Who replaces a dead bulb.
+-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+-pub enum Replace {
+-    /// Someone comes round with a new one after a minute or so.
+-    #[default]
+-    Automatically,
+-    /// It stays out, even when the clock is restarted, until it's clicked.
+-    ByHand,
+-}
+-
+-/// How often bulbs fail.
+-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+-pub enum Failures {
+-    Never,
+-    #[default]
+-    Sometimes,
+-    Often,
+-    /// For the impatient.
+-    Hourly,
+-}
+-
+-impl Failures {
+-    pub const ALL: [Failures; 4] = [
+-        Failures::Never,
+-        Failures::Sometimes,
+-        Failures::Often,
+-        Failures::Hourly,
+-    ];
+-
+-    pub fn label(self) -> &'static str {
+-        match self {
+-            Failures::Never => "Never fail",
+-            Failures::Sometimes => "Fail every few days",
+-            Failures::Often => "Fail about once a day",
+-            Failures::Hourly => "Fail about every hour",
+-        }
+-    }
+-
+-    /// The average seconds, while the clock is running, between a bulb
+-    /// starting to play up, anywhere on the board. When is left to chance:
+-    /// it could be minutes after the last, or a week.
+-    fn every(self) -> Option<f64> {
+-        match self {
+-            Failures::Never => None,
+-            Failures::Sometimes => Some(4.0 * DAY),
+-            Failures::Often => Some(DAY),
+-            Failures::Hourly => Some(3600.0),
+-        }
+-    }
+-}
+-
+-#[derive(Clone, Copy)]
+-struct MoodLook {
+-    /// The light everywhere, lamps or not, from 0 to 1.
+-    ambient: f32,
+-    /// How much a lamp adds under itself.
+-    lamp: f32,
+-    /// How much warm colour a lamp adds.
+-    glow: f32,
+-    tint: [f32; 3],
+-    shadow: f32,
+-}
+-
+-#[derive(Clone, Copy, Debug, PartialEq)]
+-enum State {
+-    Lit,
+-    /// Sputtering until `until`, its brightness jumping about; then it
+-    /// comes good, or `dies`.
+-    Flicker {
+-        until: f64,
+-        next: f64,
+-        dies: bool,
+-    },
+-    /// Out until it's replaced, at `until`, or, if that's infinite, by
+-    /// hand.
+-    Dead {
+-        until: f64,
+-    },
+-}
+-
+-#[derive(Clone, Copy)]
+-struct Lamp {
+-    state: State,
+-    /// How bright the filament is, chasing `target` with a little lag, as a
+-    /// real filament warms and cools.
+-    power: f32,
+-    target: f32,
+-}
+-
+-impl Lamp {
+-    fn new() -> Self {
+-        Self {
+-            state: State::Lit,
+-            power: 1.0,
+-            target: 1.0,
+-        }
+-    }
+-}
+-
+-/// A piece of a blown bulb's glass, falling to the foot of the board and
+-/// lying there. Places and sizes are shares of the board's width and
+-/// height, so it stays put when the window changes size.
+-#[derive(Clone, Copy)]
+-struct Shard {
+-    /// Where it lands: across, from under its lamp, in lamp spacings; and
+-    /// down, as a share of the board's height.
+-    x: f32,
+-    y: f32,
+-    /// How far it drifts sideways on the way down, in lamp spacings.
+-    drift: f32,
+-    /// When it starts to fall, after the bulb blows.
+-    delay: f32,
+-    size: f32,
+-    /// Its turn when it lands, and how much it spins as it falls.
+-    angle: f32,
+-    spin: f32,
+-    /// Its corners, as angles and distances out from its middle.
+-    corners: [(f32, f32); 4],
+-    /// How bright it catches the light.
+-    shine: f32,
+-}
+-
+-/// A blown bulb's glass, under lamp `lamp`, from when it blew.
+-struct Glass {
+-    lamp: usize,
+-    at: f64,
+-    shards: Vec<Shard>,
+-    /// Being swept away, since when, and which way: -1 to the left, 1 to
+-    /// the right.
+-    swept: Option<(f64, f32)>,
+-}
+-
+-/// How fast the broom goes, a share of the board's width a second.
+-const BROOM_SPEED: f32 = 0.22;
+-
+-impl Glass {
+-    /// Where the broom is, across the board, `t` seconds into the sweep:
+-    /// from just behind the pile, out past the nearer end, in strokes.
+-    fn broom(&self, n: f32, t: f32, way: f32) -> f32 {
+-        let centre = (self.lamp as f32 + 0.5) / n;
+-        let start = centre - way * 0.5 / n;
+-        let stroke = 0.012 * (t * std::f32::consts::TAU * 1.8).sin();
+-        start + way * (BROOM_SPEED * t + stroke)
+-    }
+-
+-    /// Whether the sweep is done at `time`: the broom and the glass gone
+-    /// off the end of the board.
+-    fn swept_away(&self, n: f32, time: f64) -> bool {
+-        match self.swept {
+-            Some((since, way)) => {
+-                let x = self.broom(n, (time - since) as f32, way);
+-                if way > 0.0 {
+-                    x > 1.12
+-                } else {
+-                    x < -0.12
+-                }
+-            }
+-            None => false,
+-        }
+-    }
+-}
+-
+-/// A puff of a blown bulb's smoke, carried off sideways by the draught.
+-#[derive(Clone, Copy)]
+-struct Puff {
+-    born: f64,
+-    life: f32,
+-    x: f32,
+-    y: f32,
+-    /// How fast it sets off, and how hard the draught pushes it on, across
+-    /// the board, a share of its width a second (and a second squared).
+-    vx: f32,
+-    wind: f32,
+-    /// How fast it rises (or, caught in an eddy, sinks).
+-    vy: f32,
+-    size: f32,
+-    grow: f32,
+-    thick: f32,
+-    /// Where it is in its curl, so puffs don't wave together.
+-    phase: f32,
+-}
+-
+-/// How long a shard takes to fall the height of the board, in seconds.
+-const FALL: f32 = 0.6;
+-
+-pub struct Lighting {
+-    lamps: Vec<Lamp>,
+-    rng: Rng,
+-    /// When the lamps were last moved on.
+-    last: Option<f64>,
+-    glass: Vec<Glass>,
+-    smoke: Vec<Puff>,
+-    /// Bulbs that have blown since [`Lighting::take_pops`] was last asked,
+-    /// for the sound.
+-    pops: Vec<usize>,
+-    /// When each bulb blew, for its flash.
+-    flashes: Vec<(usize, f64)>,
+-}
+-
+-impl Lighting {
+-    pub fn new(rng: Rng) -> Self {
+-        Self {
+-            lamps: Vec::new(),
+-            rng,
+-            last: None,
+-            glass: Vec::new(),
+-            smoke: Vec::new(),
+-            pops: Vec::new(),
+-            flashes: Vec::new(),
+-        }
+-    }
+-
+-    /// Moves the lamps on to `time`, for a board lit by `n` lamps. Whether
+-    /// anything is changing, so the board should be drawn again soon. The
+-    /// time since the last call is measured, not taken from the frame rate,
+-    /// as a still board is only drawn about once a second.
+-    pub fn update(&mut self, n: usize, time: f64, failures: Failures, replace: Replace) -> bool {
+-        let dt = self.last.map_or(0.0, |last| (time - last).clamp(0.0, 2.0));
+-        self.last = Some(time);
+-        self.lamps.resize(n, Lamp::new());
+-        // A new problem somewhere on the board, now and then.
+-        if let Some(every) = failures.every() {
+-            if self.rng.between(0.0, 1.0) < dt / every {
+-                let pick = self.rng.between(0.0, n as f64) as usize;
+-                if let Some(lamp) = self.lamps.get_mut(pick.min(n.saturating_sub(1))) {
+-                    if lamp.state == State::Lit {
+-                        let until = time + self.rng.between(1.5, 6.0);
+-                        let dies = self.rng.between(0.0, 1.0) < 0.35;
+-                        lamp.state = State::Flicker {
+-                            until,
+-                            next: time,
+-                            dies,
+-                        };
+-                    }
+-                }
+-            }
+-        }
+-        if failures == Failures::Never {
+-            for lamp in &mut self.lamps {
+-                lamp.state = State::Lit;
+-                lamp.target = 1.0;
+-            }
+-        }
+-        let mut busy = false;
+-        for i in 0..self.lamps.len() {
+-            let mut lamp = self.lamps[i];
+-            match lamp.state {
+-                State::Lit => lamp.target = 1.0,
+-                State::Flicker { until, next, dies } => {
+-                    if time >= until {
+-                        if dies {
+-                            lamp.state = State::Dead {
+-                                until: f64::INFINITY,
+-                            };
+-                            lamp.target = 0.0;
+-                            // A flash, then it blows.
+-                            lamp.power = 1.0;
+-                            self.blow_up(i, n, time);
+-                        } else {
+-                            lamp.state = State::Lit;
+-                            lamp.target = 1.0;
+-                        }
+-                    } else if time >= next {
+-                        // Mostly dimmed and wavering, with the odd drop out.
+-                        lamp.target = if self.rng.between(0.0, 1.0) < 0.3 {
+-                            self.rng.between(0.0, 0.15) as f32
+-                        } else {
+-                            self.rng.between(0.45, 1.0) as f32
+-                        };
+-                        let next = time + self.rng.between(0.04, 0.18);
+-                        lamp.state = State::Flicker { until, next, dies };
+-                    }
+-                    busy = true;
+-                }
+-                State::Dead { until } => {
+-                    lamp.target = 0.0;
+-                    if replace == Replace::Automatically && until.is_infinite() {
+-                        // Someone will be round with a new one.
+-                        lamp.state = State::Dead {
+-                            until: time + self.rng.between(20.0, 90.0),
+-                        };
+-                    } else if replace == Replace::ByHand && until.is_finite() {
+-                        lamp.state = State::Dead {
+-                            until: f64::INFINITY,
+-                        };
+-                    } else if time >= until {
+-                        // A new bulb, which sputters for a moment on, and
+-                        // the glass swept up.
+-                        self.sweep(i, time);
+-                        let until = time + self.rng.between(0.3, 1.2);
+-                        lamp.state = State::Flicker {
+-                            until,
+-                            next: time,
+-                            dies: false,
+-                        };
+-                    }
+-                }
+-            }
+-            // The filament's lag: about 60 ms to warm or cool.
+-            let k = 1.0 - (-dt / 0.06).exp() as f32;
+-            lamp.power += (lamp.target - lamp.power) * k;
+-            if (lamp.target - lamp.power).abs() > 0.01 {
+-                busy = true;
+-            }
+-            self.lamps[i] = lamp;
+-        }
+-        // Smoke drifts and clears; glass falls.
+-        self.smoke.retain(|p| time - p.born < p.life as f64);
+-        self.flashes.retain(|(_, at)| time - at < 0.5);
+-        let lamps = n.max(1) as f32;
+-        self.glass
+-            .retain(|g| g.lamp < n && !g.swept_away(lamps, time));
+-        busy |= !self.smoke.is_empty()
+-            || !self.flashes.is_empty()
+-            || self
+-                .glass
+-                .iter()
+-                .any(|g| time - g.at < (FALL + 0.3) as f64 || g.swept.is_some());
+-        busy
+-    }
+-
+-    /// Makes a bulb that's lit blow, after a moment's flickering: the one at
+-    /// random, for anyone who can't wait.
+-    pub fn blow(&mut self, time: f64) -> bool {
+-        let lit: Vec<usize> = (0..self.lamps.len())
+-            .filter(|&i| self.lamps[i].state == State::Lit)
+-            .collect();
+-        if lit.is_empty() {
+-            return false;
+-        }
+-        let pick = lit[(self.rng.between(0.0, lit.len() as f64) as usize).min(lit.len() - 1)];
+-        self.lamps[pick].state = State::Flicker {
+-            until: time + self.rng.between(1.2, 2.2),
+-            next: time,
+-            dies: true,
+-        };
+-        true
+-    }
+-
+-    /// The bulbs that have blown since this was last asked, by their place
+-    /// from the left, and how many lamps there are.
+-    pub fn take_pops(&mut self) -> (Vec<usize>, usize) {
+-        (std::mem::take(&mut self.pops), self.lamps.len())
+-    }
+-
+-    /// Bulb `i` of `n` blows at `time`: its glass falls and its smoke rises.
+-    fn blow_up(&mut self, i: usize, n: usize, time: f64) {
+-        self.pops.push(i);
+-        self.flashes.push((i, time));
+-        let x = (i as f32 + 0.5) / n.max(1) as f32;
+-        let mut r = |lo: f32, hi: f32| self.rng.between(lo as f64, hi as f64) as f32;
+-        let count = r(9.0, 15.0) as usize;
+-        let mut shards = Vec::with_capacity(count);
+-        for _ in 0..count {
+-            let size = r(0.009, 0.022);
+-            // Four corners, roughly a quarter turn apart, so it's a convex
+-            // sliver of some shape or other.
+-            let mut corners = [(0.0, 0.0); 4];
+-            let start = r(0.0, 6.3);
+-            for (k, c) in corners.iter_mut().enumerate() {
+-                let a = start + k as f32 * std::f32::consts::FRAC_PI_2 + r(-0.45, 0.45);
+-                *c = (a, r(0.35, 1.0));
+-            }
+-            shards.push(Shard {
+-                x: r(-0.32, 0.32),
+-                y: 1.0 - r(0.006, 0.03),
+-                drift: r(-0.08, 0.08),
+-                delay: r(0.0, 0.12),
+-                size,
+-                angle: r(0.0, 6.3),
+-                spin: r(-9.0, 9.0),
+-                corners,
+-                shine: r(0.5, 1.0),
+-            });
+-        }
+-        // Glass from an earlier bulb there has been swept up already.
+-        self.glass.retain(|g| g.lamp != i);
+-        self.glass.push(Glass {
+-            lamp: i,
+-            at: time,
+-            shards,
+-            swept: None,
+-        });
+-        let mut r = |lo: f32, hi: f32| self.rng.between(lo as f64, hi as f64) as f32;
+-        // The draught takes the smoke one way or the other, a thin trail
+-        // that thins as it goes: mostly across the board rather than off
+-        // its edge.
+-        let inward = if x < 0.5 { 1.0 } else { -1.0 };
+-        let way = if r(0.0, 1.0) < 0.8 { inward } else { -inward };
+-        let draught = r(0.6, 1.4);
+-        for k in 0..16 {
+-            let puff = Puff {
+-                born: time + k as f64 * 0.14 + r(0.0, 0.1) as f64,
+-                life: r(3.8, 6.0),
+-                x: x + r(-0.006, 0.006),
+-                y: r(0.03, 0.07),
+-                vx: way * draught * r(0.02, 0.045),
+-                wind: way * draught * r(0.012, 0.028),
+-                vy: r(-0.012, 0.01),
+-                size: r(0.01, 0.018),
+-                grow: r(0.015, 0.03),
+-                thick: r(0.28, 0.5),
+-                phase: r(0.0, 6.3),
+-            };
+-            self.smoke.push(puff);
+-        }
+-    }
+-
+-    /// The bulbs that are out, by their place from the left.
+-    pub fn dead(&self) -> Vec<usize> {
+-        (0..self.lamps.len())
+-            .filter(|&i| matches!(self.lamps[i].state, State::Dead { .. }))
+-            .collect()
+-    }
+-
+-    /// Puts back the bulbs that were out when the clock last ran.
+-    pub fn restore(&mut self, dead: &[usize]) {
+-        for &i in dead {
+-            if i >= self.lamps.len() {
+-                self.lamps.resize(i + 1, Lamp::new());
+-            }
+-            // Its glass, still lying where it fell, long since quiet.
+-            self.blow_up(i, 1, f64::NEG_INFINITY);
+-            self.pops.clear();
+-            self.flashes.clear();
+-            self.smoke.clear();
+-            self.lamps[i] = Lamp {
+-                state: State::Dead {
+-                    until: f64::INFINITY,
+-                },
+-                power: 0.0,
+-                target: 0.0,
+-            };
+-        }
+-    }
+-
+-    /// Screws in a new bulb at `i`, if that one is out: it sputters for a
+-    /// moment, then comes on.
+-    pub fn replace(&mut self, i: usize, time: f64) -> bool {
+-        match self.lamps.get_mut(i) {
+-            Some(lamp) if matches!(lamp.state, State::Dead { .. }) => {
+-                lamp.state = State::Flicker {
+-                    until: time + self.rng.between(0.3, 1.2),
+-                    next: time,
+-                    dies: false,
+-                };
+-                self.sweep(i, time);
+-                true
+-            }
+-            _ => false,
+-        }
+-    }
+-
+-    /// Sends the janitor for lamp `i`'s glass: swept off the nearer end of
+-    /// the board.
+-    fn sweep(&mut self, i: usize, time: f64) {
+-        let n = self.lamps.len().max(1) as f32;
+-        for g in self.glass.iter_mut().filter(|g| g.lamp == i) {
+-            if g.swept.is_none() {
+-                let centre = (i as f32 + 0.5) / n;
+-                let way = if centre < 0.5 { -1.0 } else { 1.0 };
+-                g.swept = Some((time, way));
+-            }
+-        }
+-    }
+-
+-    /// The lamp at `pos`, over the board at `rect`: within its glow at the
+-    /// top edge.
+-    pub fn lamp_at(&self, rect: Rect, pos: Pos2) -> Option<usize> {
+-        let n = self.lamps.len();
+-        if n == 0 || !rect.contains(pos) {
+-            return None;
+-        }
+-        let w = rect.width() / n as f32;
+-        let i = (((pos.x - rect.min.x) / w) as usize).min(n - 1);
+-        let centre = rect.min.x + w * (i as f32 + 0.5);
+-        let deep = (rect.height() * 0.12).max(24.0);
+-        ((pos.x - centre).abs() < w * 0.42 && pos.y - rect.min.y < deep).then_some(i)
+-    }
+-
+-    /// How lit a point is, at `x` across and `y` down the board, both from 0
+-    /// to 1: the ambient light and the lamps' pools.
+-    fn light(&self, look: &MoodLook, x: f32, y: f32) -> (f32, f32) {
+-        let n = self.lamps.len().max(1) as f32;
+-        let spread = 0.4 / n;
+-        let mut pools = 0.0;
+-        for (i, lamp) in self.lamps.iter().enumerate() {
+-            let lx = (i as f32 + 0.5) / n;
+-            let dx = (x - lx) / spread;
+-            pools += lamp.power * (-dx * dx).exp();
+-        }
+-        // Brightest at the top, near the lamps, fading down the board.
+-        let down = (-(y / 0.95) * (y / 0.95)).exp();
+-        let pool = pools * down;
+-        ((look.ambient + look.lamp * pool).min(1.0), look.glow * pool)
+-    }
+-
+-    /// Lights the board at `rect`, drawn already, in `mood`, at `time`,
+-    /// the lamps turned up or down by `dimmer` (1 as the mood has them):
+-    /// and any bulb that has blown, its flash, smoke and glass.
+-    pub fn draw(&self, painter: &Painter, rect: Rect, mood: Mood, dimmer: f32, time: f64) {
+-        let Some(mut look) = mood.look() else {
+-            return;
+-        };
+-        // The dimmer turns the lamps up or down; the hall's own light stays.
+-        let dimmer = dimmer.clamp(DIMMEST, BRIGHTEST);
+-        look.lamp *= dimmer;
+-        look.glow *= dimmer;
+-        const COLS: usize = 40;
+-        const ROWS: usize = 20;
+-        let mut shade = Mesh::default();
+-        let mut glow = Mesh::default();
+-        for row in 0..=ROWS {
+-            for col in 0..=COLS {
+-                let (x, y) = (col as f32 / COLS as f32, row as f32 / ROWS as f32);
+-                let p = pos2(
+-                    rect.min.x + rect.width() * x,
+-                    rect.min.y + rect.height() * y,
+-                );
+-                let (light, warmth) = self.light(&look, x, y);
+-                shade.colored_vertex(p, Color32::from_black_alpha(((1.0 - light) * 255.0) as u8));
+-                glow.colored_vertex(p, additive(look.tint, warmth));
+-            }
+-        }
+-        for row in 0..ROWS as u32 {
+-            for col in 0..COLS as u32 {
+-                let i = row * (COLS as u32 + 1) + col;
+-                let j = i + COLS as u32 + 1;
+-                for m in [&mut shade, &mut glow] {
+-                    m.add_triangle(i, i + 1, j);
+-                    m.add_triangle(i + 1, j + 1, j);
+-                }
+-            }
+-        }
+-        painter.add(shade);
+-        painter.add(glow);
+-        // The lamps themselves, just above the top edge: a warm glow each,
+-        // gone when the bulb is.
+-        let n = self.lamps.len().max(1) as f32;
+-        for (i, lamp) in self.lamps.iter().enumerate() {
+-            let x = rect.min.x + rect.width() * (i as f32 + 0.5) / n;
+-            let rx = rect.width() / n * 0.42;
+-            let ry = (rect.height() * 0.08).max(8.0);
+-            painter.add(halo(
+-                pos2(x, rect.min.y),
+-                rx,
+-                ry,
+-                additive(look.tint, 0.55 * lamp.power * dimmer),
+-            ));
+-        }
+-        let at = |x: f32, y: f32| {
+-            pos2(
+-                rect.min.x + rect.width() * x,
+-                rect.min.y + rect.height() * y,
+-            )
+-        };
+-        // A blowing bulb's last flash, white hot.
+-        for &(i, when) in &self.flashes {
+-            let k = (1.0 - (time - when) as f32 / 0.35).max(0.0);
+-            if k > 0.0 {
+-                painter.add(halo(
+-                    at((i as f32 + 0.5) / n, 0.0),
+-                    rect.width() / n * 0.9,
+-                    rect.height() * 0.4,
+-                    additive([1.0, 0.95, 0.85], k * k),
+-                ));
+-            }
+-        }
+-        // Its smoke, spreading under the top of the board and clearing.
+-        for p in &self.smoke {
+-            let age = (time - p.born) as f32;
+-            if age < 0.0 {
+-                continue;
+-            }
+-            let fade = (1.0 - age / p.life).max(0.0);
+-            let alpha = p.thick * (age / 0.3).min(1.0) * fade * fade * 0.85;
+-            let radius = (p.size + p.grow * age) * rect.height();
+-            // Off with the draught, curling as it goes.
+-            let x = p.x + p.vx * age + 0.5 * p.wind * age * age;
+-            let curl = (age * 2.4 + p.phase).sin() * 0.012 * age.min(1.5);
+-            let y = (p.y + p.vy * age + curl).max(0.008);
+-            painter.add(halo(
+-                at(x, y),
+-                radius * 1.8,
+-                radius,
+-                Color32::from_rgba_unmultiplied(132, 127, 120, (alpha * 255.0) as u8),
+-            ));
+-        }
+-        // Its glass, falling to the foot of the board and lying there,
+-        // catching what light there is.
+-        for g in &self.glass {
+-            let centre = (g.lamp as f32 + 0.5) / n;
+-            // Where the broom is, if the janitor's at work.
+-            let broom = g.swept.map(|(since, way)| {
+-                let t = (time - since) as f32;
+-                (g.broom(n, t, way), way, t)
+-            });
+-            for sh in &g.shards {
+-                let t = (time - g.at) as f32 - sh.delay;
+-                if t < 0.0 {
+-                    continue;
+-                }
+-                let s = (t / FALL).min(1.0);
+-                let mut x = centre + (sh.x * (0.3 + 0.7 * s) + sh.drift * s) / n;
+-                let top = 0.03;
+-                let mut y = top + (sh.y - top) * s * s;
+-                let mut angle = sh.angle + sh.spin * (1.0 - s);
+-                // Pushed along in front of the broom, skittering as it goes.
+-                if let Some((bx, way, _)) = broom {
+-                    let front = bx + way * (0.018 + sh.size * 0.8);
+-                    let pushed = if way > 0.0 { front - x } else { x - front };
+-                    if pushed > 0.0 {
+-                        x = front;
+-                        y -= 0.006 * (pushed * 90.0).sin().abs();
+-                        angle += pushed * sh.spin * 3.0;
+-                    }
+-                }
+-                let size = sh.size * rect.height();
+-                let middle = at(x, y);
+-                let points: Vec<Pos2> = sh
+-                    .corners
+-                    .iter()
+-                    .map(|&(a, d)| {
+-                        let a = a + angle;
+-                        middle + egui::vec2(a.cos(), a.sin() * 0.6) * d * size
+-                    })
+-                    .collect();
+-                let lit = self.light(&look, x, y).0 * sh.shine;
+-                let fill =
+-                    Color32::from_rgba_unmultiplied(196, 206, 212, (50.0 + 110.0 * lit) as u8);
+-                let edge =
+-                    Color32::from_rgba_unmultiplied(255, 248, 230, (70.0 + 170.0 * lit) as u8);
+-                let glint = points[0];
+-                painter.add(egui::Shape::convex_polygon(
+-                    points,
+-                    fill,
+-                    egui::Stroke::new(0.8, edge),
+-                ));
+-                // The odd piece catches the light at a corner.
+-                if sh.shine > 0.8 {
+-                    painter.add(halo(
+-                        glint,
+-                        size * 0.9,
+-                        size * 0.9,
+-                        additive([1.0, 0.96, 0.86], 0.25 + 0.6 * lit),
+-                    ));
+-                }
+-            }
+-            if let Some((bx, way, t)) = broom {
+-                let lit = self.light(&look, bx.clamp(0.0, 1.0), 0.95).0;
+-                draw_broom(painter, rect, bx, way, (t / 0.25).min(1.0), lit);
+-            }
+-        }
+-    }
+-}
+-
+-/// The janitor's broom at `x` across the foot of the board at `rect`,
+-/// pushing `way` (-1 left, 1 right), its handle leaning back the other way;
+-/// `fade` from 0 to 1 as it comes into view, in `lit` light.
+-fn draw_broom(painter: &Painter, rect: Rect, x: f32, way: f32, fade: f32, lit: f32) {
+-    let shade = |c: [u8; 3]| {
+-        let k = 0.35 + 0.65 * lit;
+-        Color32::from_rgba_unmultiplied(
+-            (c[0] as f32 * k) as u8,
+-            (c[1] as f32 * k) as u8,
+-            (c[2] as f32 * k) as u8,
+-            (fade * 255.0) as u8,
+-        )
+-    };
+-    let foot = rect.max.y - 1.0;
+-    let cx = rect.min.x + rect.width() * x;
+-    let w = (rect.width() * 0.05).max(14.0);
+-    let h = (rect.height() * 0.04).max(7.0);
+-    // The handle, from the head up and back.
+-    let neck = egui::pos2(cx - way * w * 0.1, foot - h * 1.15);
+-    let grip = neck + egui::vec2(-way * w * 1.5, -rect.height() * 0.3);
+-    painter.line_segment(
+-        [neck, grip],
+-        egui::Stroke::new((w * 0.11).max(2.0), shade([118, 80, 44])),
+-    );
+-    // The head, a wooden block with the bristles under it, splayed by the
+-    // push.
+-    let block = Rect::from_min_max(
+-        egui::pos2(cx - w * 0.45, foot - h * 1.25),
+-        egui::pos2(cx + w * 0.45, foot - h * 0.85),
+-    );
+-    painter.rect_filled(block, 2.0, shade([92, 62, 36]));
+-    let splay = -way * w * 0.12;
+-    painter.add(egui::Shape::convex_polygon(
+-        vec![
+-            egui::pos2(cx - w * 0.42, foot - h * 0.85),
+-            egui::pos2(cx + w * 0.42, foot - h * 0.85),
+-            egui::pos2(cx + w * 0.5 + splay, foot),
+-            egui::pos2(cx - w * 0.5 + splay, foot),
+-        ],
+-        shade([186, 150, 82]),
+-        egui::Stroke::NONE,
+-    ));
+-}
+-
+-/// A colour to add on top, rather than paint over: premultiplied, with no
+-/// alpha.
+-fn additive(tint: [f32; 3], amount: f32) -> Color32 {
+-    let c = |t: f32| (t * amount.clamp(0.0, 1.0) * 255.0) as u8;
+-    Color32::from_rgba_premultiplied(c(tint[0]), c(tint[1]), c(tint[2]), 0)
+-}
+-
+-/// A soft oval glow, `colour` at its centre fading to nothing at its edge.
+-pub fn halo(centre: Pos2, rx: f32, ry: f32, colour: Color32) -> Mesh {
+-    let mut m = Mesh::default();
+-    m.colored_vertex(centre, colour);
+-    const N: u32 = 32;
+-    for k in 0..N {
+-        let a = k as f32 / N as f32 * std::f32::consts::TAU;
+-        m.colored_vertex(
+-            centre + egui::vec2(a.cos() * rx, a.sin() * ry),
+-            Color32::TRANSPARENT,
+-        );
+-    }
+-    for k in 0..N {
+-        m.add_triangle(0, 1 + k, 1 + (k + 1) % N);
+-    }
+-    m
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn brightest_under_a_lamp_and_near_the_top() {
+-        let mut l = Lighting::new(Rng::with_seed(1));
+-        l.update(3, 0.0, Failures::Never, Replace::Automatically);
+-        let look = Mood::Warm.look().unwrap();
+-        let under = l.light(&look, 0.5, 0.1).0;
+-        let between = l.light(&look, 1.0 / 3.0, 0.1).0;
+-        let low = l.light(&look, 0.5, 0.95).0;
+-        assert!(under > between && under > low, "{under} {between} {low}");
+-        assert!(low >= look.ambient);
+-    }
+-
+-    #[test]
+-    fn a_dead_bulb_leaves_its_pool_dark_until_replaced() {
+-        let mut l = Lighting::new(Rng::with_seed(2));
+-        l.update(3, 0.0, Failures::Sometimes, Replace::Automatically);
+-        l.lamps[1].state = State::Flicker {
+-            until: 1.0,
+-            next: 0.0,
+-            dies: true,
+-        };
+-        let mut t = 0.0;
+-        while t < 3.0 {
+-            l.update(3, t, Failures::Sometimes, Replace::Automatically);
+-            t += 0.016;
+-        }
+-        assert!(matches!(l.lamps[1].state, State::Dead { .. }));
+-        assert!(l.lamps[1].power < 0.05);
+-        let look = Mood::Warm.look().unwrap();
+-        assert!(l.light(&look, 0.5, 0.1).0 < l.light(&look, 1.0 / 6.0, 0.1).0);
+-        // And comes back on, in time.
+-        let mut t = 3.0;
+-        while t < 100.0 {
+-            l.update(3, t, Failures::Never, Replace::Automatically);
+-            t += 0.05;
+-        }
+-        assert!(l.lamps[1].power > 0.95);
+-    }
+-
+-    #[test]
+-    fn by_hand_a_dead_bulb_stays_out_until_it_is_clicked() {
+-        let mut l = Lighting::new(Rng::with_seed(4));
+-        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(600.0, 300.0));
+-        l.update(3, 0.0, Failures::Never, Replace::ByHand);
+-        l.lamps[2].state = State::Flicker {
+-            until: 1.0,
+-            next: 0.0,
+-            dies: true,
+-        };
+-        let mut t = 0.0;
+-        while t < 600.0 {
+-            l.update(3, t, Failures::Sometimes, Replace::ByHand);
+-            t += 0.5;
+-        }
+-        assert_eq!(l.dead(), vec![2]);
+-        // Restarted, it's still out.
+-        let mut again = Lighting::new(Rng::with_seed(5));
+-        again.restore(&l.dead());
+-        again.update(3, 0.0, Failures::Sometimes, Replace::ByHand);
+-        assert_eq!(again.dead(), vec![2]);
+-        // A click between the lamps, or low on the board, misses.
+-        assert_eq!(again.lamp_at(rect, pos2(200.0, 5.0)), None);
+-        assert_eq!(again.lamp_at(rect, pos2(500.0, 200.0)), None);
+-        assert!(!again.replace(1, 0.0));
+-        let at = again.lamp_at(rect, pos2(510.0, 8.0)).unwrap();
+-        assert!(again.replace(at, 0.0));
+-        let mut t = 0.0;
+-        while t < 3.0 {
+-            again.update(3, t, Failures::Sometimes, Replace::ByHand);
+-            t += 0.016;
+-        }
+-        assert!(again.dead().is_empty());
+-        assert!(again.lamps[2].power > 0.95);
+-    }
+-
+-    #[test]
+-    fn a_blown_bulb_pops_smokes_and_leaves_its_glass_until_replaced() {
+-        let mut l = Lighting::new(Rng::with_seed(6));
+-        l.update(3, 0.0, Failures::Sometimes, Replace::ByHand);
+-        assert!(l.blow(0.0));
+-        let mut t = 0.0;
+-        while t < 3.0 {
+-            l.update(3, t, Failures::Sometimes, Replace::ByHand);
+-            t += 0.05;
+-        }
+-        let dead = l.dead();
+-        assert_eq!(dead.len(), 1);
+-        let (pops, n) = l.take_pops();
+-        assert_eq!((pops, n), (dead.clone(), 3));
+-        assert!(l.take_pops().0.is_empty());
+-        assert_eq!(l.glass.len(), 1);
+-        assert!(l.glass[0].shards.len() >= 7);
+-        assert!(!l.smoke.is_empty());
+-        // The smoke clears; the glass stays, and so does the dark.
+-        while t < 20.0 {
+-            l.update(3, t, Failures::Sometimes, Replace::ByHand);
+-            t += 0.5;
+-        }
+-        assert!(l.smoke.is_empty());
+-        assert_eq!(l.glass.len(), 1);
+-        assert_eq!(l.dead(), dead);
+-        // A new bulb, and the janitor sweeps the glass away: it's still
+-        // there while the broom is at work, then gone.
+-        assert!(l.replace(dead[0], t));
+-        assert_eq!(l.glass.len(), 1);
+-        assert!(l.glass[0].swept.is_some());
+-        let mut t2 = t;
+-        while t2 < t + 2.0 {
+-            assert!(l.update(3, t2, Failures::Sometimes, Replace::ByHand));
+-            t2 += 0.05;
+-        }
+-        assert_eq!(l.glass.len(), 1, "still sweeping");
+-        while t2 < t + 8.0 {
+-            l.update(3, t2, Failures::Sometimes, Replace::ByHand);
+-            t2 += 0.05;
+-        }
+-        assert!(l.glass.is_empty());
+-    }
+-
+-    #[test]
+-    fn bulbs_out_after_a_restart_have_their_glass_but_make_no_fuss() {
+-        let mut l = Lighting::new(Rng::with_seed(8));
+-        l.restore(&[1]);
+-        assert!(!l.update(3, 0.0, Failures::Sometimes, Replace::ByHand));
+-        assert!(l.take_pops().0.is_empty());
+-        assert!(l.smoke.is_empty());
+-        assert_eq!(l.glass.len(), 1);
+-    }
+-
+-    #[test]
+-    fn failures_happen_about_as_often_as_asked() {
+-        let mut l = Lighting::new(Rng::with_seed(3));
+-        let mut starts = 0;
+-        let mut t = 0.0;
+-        // Thirty days, with a bulb failing about once a day.
+-        while t < 30.0 * DAY {
+-            let before: Vec<bool> = l.lamps.iter().map(|x| x.state == State::Lit).collect();
+-            l.update(4, t, Failures::Often, Replace::Automatically);
+-            for (i, lamp) in l.lamps.iter().enumerate() {
+-                if before.get(i) == Some(&true) && lamp.state != State::Lit {
+-                    starts += 1;
+-                }
+-            }
+-            t += 2.0;
+-        }
+-        assert!((15..=50).contains(&starts), "{starts}");
+-    }
+-}
+diff --git a/src/main.rs b/src/main.rs
+index 9d90f2c..ad1a83d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -6,13 +6,13 @@ mod app;
+ mod autostart;
+ mod cities;
+ mod desktops;
+-mod flap;
+ mod icon;
+-mod lighting;
+ mod places;
+-mod rng;
+ mod sky;
+-mod sound;
++
++// The cards, their clatter and the lamps come from the splitflap crate,
++// shared with Now Boarding.
++use splitflap::{flap, lighting, rng, sound};
+ 
+ fn main() -> eframe::Result {
+     autostart::refresh();
+diff --git a/src/rng.rs b/src/rng.rs
+deleted file mode 100644
+index fb5b583..0000000
+--- a/src/rng.rs
++++ /dev/null
+@@ -1,52 +0,0 @@
+-//! A small random number source for the board's refreshes and its sound.
+-
+-/// Xorshift: nothing here needs more.
+-pub struct Rng(u64);
+-
+-impl Rng {
+-    pub fn seeded() -> Self {
+-        let nanos = std::time::SystemTime::now()
+-            .duration_since(std::time::UNIX_EPOCH)
+-            .map(|d| d.as_nanos() as u64)
+-            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+-        Self(nanos | 1)
+-    }
+-
+-    /// The same numbers every time, for tests.
+-    #[cfg(test)]
+-    pub fn with_seed(seed: u64) -> Self {
+-        Self(seed | 1)
+-    }
+-
+-    /// A number from `lo` up to `hi`.
+-    pub fn between(&mut self, lo: f64, hi: f64) -> f64 {
+-        let mut x = self.0;
+-        x ^= x << 13;
+-        x ^= x >> 7;
+-        x ^= x << 17;
+-        self.0 = x;
+-        lo + (hi - lo) * ((x >> 11) as f64 / (1u64 << 53) as f64)
+-    }
+-
+-    /// When a card sets off, in seconds from now, and how long its quick
+-    /// flips take as a share of the usual. Every card on a real board gets
+-    /// the word at once, but each starts a moment apart and runs at its own
+-    /// speed.
+-    pub fn scatter(&mut self) -> (f64, f64) {
+-        (self.between(0.0, 0.9), self.between(0.8, 1.25))
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn random_numbers_stay_in_range() {
+-        let mut rng = Rng::with_seed(12345);
+-        let draws: Vec<f64> = (0..1000).map(|_| rng.between(10.0, 60.0)).collect();
+-        assert!(draws.iter().all(|&x| (10.0..60.0).contains(&x)));
+-        // Spread across the range, not bunched at one end.
+-        assert!(draws.iter().any(|&x| x < 20.0) && draws.iter().any(|&x| x > 50.0));
+-    }
+-}
+diff --git a/src/sound.rs b/src/sound.rs
+deleted file mode 100644
+index b547f0a..0000000
+--- a/src/sound.rs
++++ /dev/null
+@@ -1,670 +0,0 @@
+-//! The board's clatter: a click for every flap that falls, synthesised as it
+-//! plays, so there are no recordings to carry.
+-//!
+-//! A click is a very short burst of noise, the flap striking its stop, rung
+-//! through two resonances, the flap's own ring and the module's body. A
+-//! flap that lands adds a low knock. Every click is a little different in
+-//! pitch, loudness and timing, and bigger cards sound lower and louder, so
+-//! a whole board spinning sounds like a real one.
+-//!
+-//! A bulb that blows pops: a sharp crack with a thump, then the tinkle of
+-//! its glass landing a moment later.
+-//!
+-//! The alarm's chime is the airport kind: two soft bell notes, high then
+-//! low, "bing-bong", made the same way from a few sine partials.
+-//!
+-//! [`Clatter`] is plain Rust and allocates nothing once made; the audio
+-//! callback runs it, fed through a lock-free queue.
+-
+-use std::sync::atomic::{AtomicU32, Ordering};
+-use std::sync::Arc;
+-
+-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+-use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+-
+-use crate::rng::Rng;
+-
+-/// One flap falling.
+-#[derive(Clone, Copy, Debug)]
+-pub struct Click {
+-    /// Where the card is, from -1 (left of the board) to 1 (right).
+-    pub pan: f32,
+-    /// The card's height in board units: bigger cards sound bigger.
+-    pub size: f32,
+-    /// The last flip, onto the symbol the card was after.
+-    pub land: bool,
+-}
+-
+-/// What the board asks the sound to play.
+-#[derive(Clone, Copy, Debug)]
+-pub enum Event {
+-    Click(Click),
+-    /// The alarm chime, at its own volume from 0 to 1.
+-    Chime(f32),
+-    /// A bulb blowing, from -1 (left of the board) to 1 (right), at its
+-    /// own volume from 0 to 1.
+-    Pop(f32, f32),
+-}
+-
+-const VOICES: usize = 64;
+-const TONES: usize = 24;
+-/// The chime's two notes, E5 then C5, and the time between them.
+-const CHIME: [f32; 2] = [659.25, 523.25];
+-const CHIME_GAP: f32 = 0.5;
+-/// Each note's partials, as multiples of its pitch, and their levels.
+-const PARTIALS: [(f32, f32); 3] = [(1.0, 1.0), (2.0, 0.18), (3.0, 0.06)];
+-/// A piece of glass rings at a pitch and two higher partials that aren't
+-/// harmonics of it, which is what makes it sound like glass.
+-const GLASS: [(f32, f32); 3] = [(1.0, 1.0), (2.32, 0.45), (4.25, 0.2)];
+-/// How long a click lasts, in seconds.
+-const LIFE: f32 = 0.06;
+-
+-#[derive(Clone, Copy, Default)]
+-struct Voice {
+-    live: bool,
+-    /// Samples to wait before starting, so clicks from one frame spread out.
+-    wait: u32,
+-    age: u32,
+-    left: f32,
+-    right: f32,
+-    strike: f32,
+-    strike_decay: f32,
+-    ring: Resonator,
+-    body: Resonator,
+-    knock: f32,
+-    knock_phase: f32,
+-    knock_step: f32,
+-    knock_decay: f32,
+-    /// At its own volume, rather than the clatter's.
+-    own: bool,
+-}
+-
+-/// One bell note of the chime.
+-#[derive(Clone, Copy, Default)]
+-struct Tone {
+-    live: bool,
+-    wait: u32,
+-    age: u32,
+-    life: u32,
+-    attack: u32,
+-    level: f32,
+-    env: f32,
+-    decay: f32,
+-    steps: [f32; 3],
+-    phases: [f32; 3],
+-    /// Each partial's level.
+-    amps: [f32; 3],
+-    /// A slow, gentle wobble in level, as a struck bar has.
+-    wobble: f32,
+-    wobble_step: f32,
+-}
+-
+-impl Tone {
+-    fn sample(&mut self) -> f32 {
+-        if self.wait > 0 {
+-            self.wait -= 1;
+-            return 0.0;
+-        }
+-        let rise = (self.age as f32 / self.attack.max(1) as f32).min(1.0);
+-        let mut s = 0.0;
+-        for k in 0..3 {
+-            s += self.amps[k] * self.phases[k].sin();
+-            self.phases[k] = (self.phases[k] + self.steps[k]) % std::f32::consts::TAU;
+-        }
+-        let wobble = 1.0 + 0.08 * self.wobble.sin();
+-        self.wobble += self.wobble_step;
+-        let out = s * self.level * self.env * rise * wobble;
+-        self.env *= self.decay;
+-        self.age += 1;
+-        if self.age > self.life {
+-            self.live = false;
+-        }
+-        out
+-    }
+-}
+-
+-/// A two-pole resonator, about unity gain at its centre.
+-#[derive(Clone, Copy, Default)]
+-struct Resonator {
+-    a1: f32,
+-    a2: f32,
+-    gain: f32,
+-    y1: f32,
+-    y2: f32,
+-}
+-
+-impl Resonator {
+-    fn new(freq: f32, width: f32, rate: f32) -> Self {
+-        let r = (-std::f32::consts::PI * width / rate).exp();
+-        let w = std::f32::consts::TAU * freq / rate;
+-        Self {
+-            a1: 2.0 * r * w.cos(),
+-            a2: -r * r,
+-            gain: 1.0 - r,
+-            y1: 0.0,
+-            y2: 0.0,
+-        }
+-    }
+-
+-    fn run(&mut self, x: f32) -> f32 {
+-        let y = self.gain * x + self.a1 * self.y1 + self.a2 * self.y2;
+-        self.y2 = self.y1;
+-        self.y1 = y;
+-        y
+-    }
+-}
+-
+-pub struct Clatter {
+-    rate: f32,
+-    voices: [Voice; VOICES],
+-    tones: [Tone; TONES],
+-    rng: Rng,
+-}
+-
+-impl Clatter {
+-    pub fn new(rate: f32, rng: Rng) -> Self {
+-        Self {
+-            rate,
+-            voices: [Voice::default(); VOICES],
+-            tones: [Tone::default(); TONES],
+-            rng,
+-        }
+-    }
+-
+-    fn rand(&mut self, lo: f32, hi: f32) -> f32 {
+-        self.rng.between(lo as f64, hi as f64) as f32
+-    }
+-
+-    pub fn trigger(&mut self, c: Click) {
+-        let rate = self.rate;
+-        // Bigger flaps ring lower and hit harder.
+-        let size = (c.size / 32.0).clamp(0.5, 4.0);
+-        let tone = size.powf(-0.35) * self.rand(0.88, 1.12) * if c.land { 0.85 } else { 1.0 };
+-        let gain = size.sqrt() * self.rand(0.7, 1.1) * if c.land { 1.5 } else { 1.0 };
+-        let angle = (c.pan.clamp(-1.0, 1.0) * 0.7 + 1.0) * std::f32::consts::FRAC_PI_4;
+-        let v = Voice {
+-            live: true,
+-            wait: (self.rand(0.0, 0.016) * rate) as u32,
+-            age: 0,
+-            left: gain * angle.cos(),
+-            right: gain * angle.sin(),
+-            strike: 1.0,
+-            strike_decay: (-1.0 / (0.0009 * rate)).exp(),
+-            ring: Resonator::new(4200.0 * tone, 600.0, rate),
+-            body: Resonator::new(1300.0 * tone, 300.0, rate),
+-            knock: if c.land { 0.2 } else { 0.0 },
+-            knock_phase: 0.0,
+-            knock_step: std::f32::consts::TAU * 240.0 * tone / rate,
+-            knock_decay: (-1.0 / (0.012 * rate)).exp(),
+-            own: false,
+-        };
+-        self.take_voice(v);
+-    }
+-
+-    pub fn play(&mut self, e: Event) {
+-        match e {
+-            Event::Click(c) => self.trigger(c),
+-            Event::Chime(gain) => self.chime(gain),
+-            Event::Pop(pan, gain) => self.pop(pan, gain),
+-        }
+-    }
+-
+-    /// A bulb blowing at `pan`: the crack of the glass and a dull thump,
+-    /// then its pieces tinkling down a moment later.
+-    pub fn pop(&mut self, pan: f32, gain: f32) {
+-        let rate = self.rate;
+-        let level = gain.clamp(0.0, 1.0);
+-        let angle = (pan.clamp(-1.0, 1.0) * 0.7 + 1.0) * std::f32::consts::FRAC_PI_4;
+-        let crack = Voice {
+-            live: true,
+-            wait: 0,
+-            age: 0,
+-            left: 1.6 * level * angle.cos(),
+-            right: 1.6 * level * angle.sin(),
+-            strike: 1.0,
+-            strike_decay: (-1.0 / (0.0025 * rate)).exp(),
+-            ring: Resonator::new(3100.0, 1400.0, rate),
+-            body: Resonator::new(850.0, 500.0, rate),
+-            knock: 0.45,
+-            knock_phase: 0.0,
+-            knock_step: std::f32::consts::TAU * 110.0 / rate,
+-            knock_decay: (-1.0 / (0.02 * rate)).exp(),
+-            own: true,
+-        };
+-        self.take_voice(crack);
+-        // The glass landing, piece by piece: sharp, brittle ticks, each
+-        // with a smaller one as it skitters, and the barest ring.
+-        for k in 0..11 {
+-            let wait = 0.42 + k as f32 * 0.03 + self.rand(0.0, 0.1);
+-            let gain = self.rand(0.8, 1.5) * level;
+-            for (bounce, (after, size)) in [(0.0, 1.0), (self.rand(0.03, 0.08), 0.4)]
+-                .into_iter()
+-                .enumerate()
+-            {
+-                let g = gain * size;
+-                let tick = Voice {
+-                    live: true,
+-                    wait: ((wait + after) * rate) as u32,
+-                    age: 0,
+-                    left: g * angle.cos(),
+-                    right: g * angle.sin(),
+-                    strike: 1.0,
+-                    strike_decay: (-1.0 / (0.00025 * rate)).exp(),
+-                    ring: Resonator::new(self.rand(7000.0, 11000.0), 420.0, rate),
+-                    body: Resonator::new(self.rand(3800.0, 5600.0), 500.0, rate),
+-                    knock: 0.0,
+-                    knock_phase: 0.0,
+-                    knock_step: 0.0,
+-                    knock_decay: 0.0,
+-                    own: true,
+-                };
+-                self.take_voice(tick);
+-                if bounce > 0 || k % 2 == 1 {
+-                    continue;
+-                }
+-                // Every other piece rings, bright and over in a moment.
+-                let freq = self.rand(4200.0, 7200.0);
+-                let ring = Tone {
+-                    live: true,
+-                    wait: (wait * rate) as u32,
+-                    age: 0,
+-                    life: (0.15 * rate) as u32,
+-                    attack: (0.0005 * rate) as u32,
+-                    level: gain * 0.1,
+-                    env: 1.0,
+-                    decay: (-1.0 / (self.rand(0.02, 0.045) * rate)).exp(),
+-                    steps: GLASS.map(|(m, _)| std::f32::consts::TAU * freq * m / rate),
+-                    phases: [0.0; 3],
+-                    amps: GLASS.map(|(_, a)| a),
+-                    wobble: 0.0,
+-                    wobble_step: 0.0,
+-                };
+-                self.take_tone(ring);
+-            }
+-        }
+-    }
+-
+-    /// Takes a free tone for `t`, or the oldest one.
+-    fn take_tone(&mut self, t: Tone) {
+-        let slot = (0..TONES)
+-            .find(|&i| !self.tones[i].live)
+-            .unwrap_or_else(|| (0..TONES).max_by_key(|&i| self.tones[i].age).unwrap_or(0));
+-        self.tones[slot] = t;
+-    }
+-
+-    /// Takes a free voice for `v`, or the oldest one.
+-    fn take_voice(&mut self, v: Voice) {
+-        let slot = (0..VOICES)
+-            .find(|&i| !self.voices[i].live)
+-            .unwrap_or_else(|| (0..VOICES).max_by_key(|&i| self.voices[i].age).unwrap_or(0));
+-        self.voices[slot] = v;
+-    }
+-
+-    /// Starts the two notes of the alarm chime.
+-    pub fn chime(&mut self, gain: f32) {
+-        let rate = self.rate;
+-        for (n, freq) in CHIME.into_iter().enumerate() {
+-            let tone = Tone {
+-                live: true,
+-                wait: (n as f32 * CHIME_GAP * rate) as u32,
+-                age: 0,
+-                life: (3.5 * rate) as u32,
+-                attack: (0.004 * rate) as u32,
+-                level: 0.8 * gain.clamp(0.0, 1.0),
+-                env: 1.0,
+-                decay: (-1.0 / (1.1 * rate)).exp(),
+-                steps: PARTIALS.map(|(m, _)| std::f32::consts::TAU * freq * m / rate),
+-                phases: [0.0; 3],
+-                amps: PARTIALS.map(|(_, a)| a),
+-                wobble: 0.0,
+-                wobble_step: std::f32::consts::TAU * 4.5 / rate,
+-            };
+-            self.take_tone(tone);
+-        }
+-    }
+-
+-    /// Adds the clicks under way to `out`, interleaved stereo, the clicks at
+-    /// `volume` and the chime at its own.
+-    pub fn render(&mut self, out: &mut [f32], volume: f32) {
+-        let life = (LIFE * self.rate) as u32;
+-        for frame in out.as_chunks_mut::<2>().0 {
+-            let (mut l, mut r) = (0.0, 0.0);
+-            let (mut own_l, mut own_r) = (0.0, 0.0);
+-            for i in 0..VOICES {
+-                if !self.voices[i].live {
+-                    continue;
+-                }
+-                if self.voices[i].wait > 0 {
+-                    self.voices[i].wait -= 1;
+-                    continue;
+-                }
+-                let noise = self.rand(-1.0, 1.0);
+-                let v = &mut self.voices[i];
+-                let x = noise * v.strike;
+-                v.strike *= v.strike_decay;
+-                let knock = v.knock * v.knock_phase.sin();
+-                v.knock *= v.knock_decay;
+-                v.knock_phase += v.knock_step;
+-                let s = 0.6 * x + 7.0 * v.ring.run(x) + 2.0 * v.body.run(x) + knock;
+-                if v.own {
+-                    own_l += s * v.left;
+-                    own_r += s * v.right;
+-                } else {
+-                    l += s * v.left;
+-                    r += s * v.right;
+-                }
+-                v.age += 1;
+-                if v.age > life {
+-                    v.live = false;
+-                }
+-            }
+-            let mut bell = 0.0;
+-            for t in self.tones.iter_mut().filter(|t| t.live) {
+-                bell += t.sample();
+-            }
+-            // A soft limit, so a whole board at once doesn't clip.
+-            frame[0] += ((l * volume + own_l + bell) * 0.5).tanh();
+-            frame[1] += ((r * volume + own_r + bell) * 0.5).tanh();
+-        }
+-    }
+-}
+-
+-/// The sound output: the queue clicks go in by, and the stream that plays
+-/// them. Dropping it closes the device.
+-pub struct Sound {
+-    events: rtrb::Producer<Event>,
+-    volume: Arc<AtomicU32>,
+-    _stream: cpal::Stream,
+-}
+-
+-impl Sound {
+-    pub fn open(volume: f32) -> Result<Self, String> {
+-        let host = cpal::default_host();
+-        let dev = host
+-            .default_output_device()
+-            .ok_or("There's no sound output to play on")?;
+-        let supported = dev.default_output_config().map_err(|e| e.to_string())?;
+-        let format = supported.sample_format();
+-        let config: StreamConfig = supported.config();
+-        let (tx, rx) = rtrb::RingBuffer::new(2048);
+-        let level = Arc::new(AtomicU32::new(gain(volume).to_bits()));
+-        let stream = match format {
+-            SampleFormat::F32 => build::<f32>(&dev, &config, rx, level.clone()),
+-            SampleFormat::I16 => build::<i16>(&dev, &config, rx, level.clone()),
+-            SampleFormat::I32 => build::<i32>(&dev, &config, rx, level.clone()),
+-            SampleFormat::U16 => build::<u16>(&dev, &config, rx, level.clone()),
+-            other => Err(format!(
+-                "The sound output wants {other} samples, which the clock can't make"
+-            )),
+-        }?;
+-        stream.play().map_err(|e| e.to_string())?;
+-        Ok(Self {
+-            events: tx,
+-            volume: level,
+-            _stream: stream,
+-        })
+-    }
+-
+-    pub fn click(&mut self, c: Click) {
+-        // A full queue just drops the click; there are plenty more.
+-        let _ = self.events.push(Event::Click(c));
+-    }
+-
+-    /// A bulb blowing, at `pan` from -1 (left) to 1 (right), at `volume`
+-    /// from 0 to 1.
+-    pub fn pop(&mut self, pan: f32, volume: f32) {
+-        let _ = self.events.push(Event::Pop(pan, gain(volume)));
+-    }
+-
+-    /// Rings the alarm chime once, at `volume` from 0 to 1.
+-    pub fn chime(&mut self, volume: f32) {
+-        let _ = self.events.push(Event::Chime(gain(volume)));
+-    }
+-
+-    pub fn set_volume(&self, v: f32) {
+-        self.volume.store(gain(v).to_bits(), Ordering::Relaxed);
+-    }
+-}
+-
+-/// The volume slider's 0 to 1 as a gain, closer to how loud it sounds.
+-fn gain(v: f32) -> f32 {
+-    let v = v.clamp(0.0, 1.0);
+-    v * v
+-}
+-
+-fn build<T>(
+-    dev: &cpal::Device,
+-    config: &StreamConfig,
+-    mut events: rtrb::Consumer<Event>,
+-    volume: Arc<AtomicU32>,
+-) -> Result<cpal::Stream, String>
+-where
+-    T: SizedSample + FromSample<f32> + Send + 'static,
+-{
+-    let channels = config.channels as usize;
+-    let mut clatter = Clatter::new(config.sample_rate as f32, Rng::seeded());
+-    // Made here, not in the callback, which must never allocate.
+-    let mut scratch = vec![0.0f32; 2 * 1024];
+-    dev.build_output_stream(
+-        *config,
+-        move |data: &mut [T], _| {
+-            while let Ok(e) = events.pop() {
+-                clatter.play(e);
+-            }
+-            let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+-            // In pieces the size of the scratch buffer, however much the
+-            // system asks for at once.
+-            for chunk in data.chunks_mut(channels * (scratch.len() / 2)) {
+-                let frames = chunk.len() / channels;
+-                let buf = &mut scratch[..frames * 2];
+-                buf.fill(0.0);
+-                clatter.render(buf, vol);
+-                for (f, out) in chunk.chunks_exact_mut(channels).enumerate() {
+-                    let (l, r) = (buf[2 * f], buf[2 * f + 1]);
+-                    for (c, s) in out.iter_mut().enumerate() {
+-                        let v = match (channels, c) {
+-                            (1, _) => 0.5 * (l + r),
+-                            (_, 0) => l,
+-                            (_, 1) => r,
+-                            _ => 0.0,
+-                        };
+-                        *s = T::from_sample(v);
+-                    }
+-                }
+-            }
+-        },
+-        // Nothing to be done from here if the device goes away.
+-        |_| {},
+-        None,
+-    )
+-    .map_err(|e| e.to_string())
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    fn click(size: f32, land: bool) -> Click {
+-        Click {
+-            pan: 0.0,
+-            size,
+-            land,
+-        }
+-    }
+-
+-    #[test]
+-    fn a_click_rings_and_dies_away() {
+-        let mut c = Clatter::new(48_000.0, Rng::with_seed(7));
+-        c.trigger(click(32.0, false));
+-        let mut out = vec![0.0; 2 * 48_000 / 5];
+-        c.render(&mut out, 1.0);
+-        let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+-        assert!(peak > 0.05 && peak < 1.0, "peak {peak}");
+-        assert!(out.iter().all(|x| x.is_finite()));
+-        // Silent once every voice is done.
+-        assert!(out[out.len() - 200..].iter().all(|&x| x == 0.0));
+-    }
+-
+-    #[test]
+-    fn a_whole_board_at_once_stays_in_range() {
+-        let mut c = Clatter::new(44_100.0, Rng::with_seed(3));
+-        for i in 0..500 {
+-            c.trigger(click(if i % 5 == 0 { 100.0 } else { 32.0 }, i % 7 == 0));
+-        }
+-        let mut out = vec![0.0; 2 * 4410];
+-        c.render(&mut out, 1.0);
+-        assert!(out.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
+-    }
+-
+-    #[test]
+-    fn the_chime_rings_two_notes_and_fades() {
+-        let rate = 48_000.0;
+-        let mut c = Clatter::new(rate, Rng::with_seed(1));
+-        c.chime(0.64);
+-        let mut out = vec![0.0; 2 * 48_000 * 5];
+-        c.render(&mut out, 1.0);
+-        let peak = |a: f32, b: f32| {
+-            out[(a * rate) as usize * 2..(b * rate) as usize * 2]
+-                .iter()
+-                .fold(0.0f32, |m, x| m.max(x.abs()))
+-        };
+-        // The second note starts half a second in, louder than the first
+-        // has become by then; then it all dies away.
+-        assert!(peak(0.0, 0.1) > 0.1);
+-        assert!(peak(0.5, 0.6) > peak(0.4, 0.5));
+-        assert!(peak(4.5, 5.0) == 0.0);
+-        assert!(out.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
+-    }
+-
+-    #[test]
+-    fn a_bulb_pops_then_its_glass_tinkles() {
+-        let rate = 48_000.0;
+-        let mut c = Clatter::new(rate, Rng::with_seed(9));
+-        c.pop(0.5, 0.5);
+-        let mut out = vec![0.0; 2 * 2 * 48_000];
+-        c.render(&mut out, 1.0);
+-        let peak = |a: f32, b: f32| {
+-            out[(a * rate) as usize * 2..(b * rate) as usize * 2]
+-                .iter()
+-                .fold(0.0f32, |m, x| m.max(x.abs()))
+-        };
+-        // The crack, a quiet moment, the glass landing in a brittle
+-        // scatter, then silence.
+-        assert!(peak(0.0, 0.05) > 0.2);
+-        assert!(peak(0.2, 0.4) < 0.01);
+-        assert!(peak(0.4, 0.75) > 0.02);
+-        assert!(peak(1.2, 2.0) == 0.0);
+-        assert!(out.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
+-        // To the right of the board, louder on the right.
+-        let (l, r) = out.chunks(2).fold((0.0f32, 0.0f32), |(l, r), f| {
+-            (l + f[0].abs(), r + f[1].abs())
+-        });
+-        assert!(r > l);
+-    }
+-
+-    /// Renders a bulb blowing to the WAV file named by `POP_WAV`.
+-    #[test]
+-    #[ignore]
+-    fn render_a_pop() {
+-        let path = std::env::var("POP_WAV").expect("set POP_WAV to a path");
+-        let mut c = Clatter::new(48_000.0, Rng::with_seed(9));
+-        c.pop(0.0, 0.5);
+-        let mut out = vec![0.0; 2 * 2 * 48_000];
+-        c.render(&mut out, 0.6);
+-        write_wav(&path, &out);
+-    }
+-
+-    /// A board like the default one starting up, with the chime rung at
+-    /// each of `chimes` seconds, as interleaved stereo at 48 kHz.
+-    fn render_board(seconds: f64, chimes: &[f64]) -> Vec<f32> {
+-        use crate::flap::{Drum, Flap};
+-        let rate = 48_000u32;
+-        let mut rng = Rng::with_seed(11);
+-        let mut clatter = Clatter::new(rate as f32, Rng::with_seed(5));
+-        // Four big digits, the date and three zones of small cards.
+-        let mut cards: Vec<(Flap, String, f32, f32)> = Vec::new();
+-        for (k, d) in ["1", "0", "4", "2"].iter().enumerate() {
+-            let (delay, pace) = rng.scatter();
+-            cards.push((
+-                Flap::new(Drum::Digit, 0.0, delay, pace),
+-                d.to_string(),
+-                100.0,
+-                k as f32 / 2.0 - 0.75,
+-            ));
+-        }
+-        let text = "TUE 27 OCT 2026LONDON      TOKYO       NEW YORK    ";
+-        for (k, ch) in text.chars().enumerate() {
+-            let (delay, pace) = rng.scatter();
+-            let pan = (k % 15) as f32 / 7.0 - 1.0;
+-            cards.push((
+-                Flap::new(Drum::Alpha, 0.0, delay, pace),
+-                ch.to_string(),
+-                32.0,
+-                pan,
+-            ));
+-        }
+-        let mut out = Vec::new();
+-        let frame = 1.0 / 60.0;
+-        let per_frame = (rate as f64 * frame) as usize;
+-        let mut rung = 0;
+-        for n in 0..(seconds / frame) as usize {
+-            let t = n as f64 * frame;
+-            while rung < chimes.len() && chimes[rung] <= t {
+-                clatter.chime(gain(0.8));
+-                rung += 1;
+-            }
+-            for (flap, want, size, pan) in &mut cards {
+-                flap.set(want);
+-                if let Some(fall) = flap.tick(t, 1.0) {
+-                    clatter.trigger(Click {
+-                        pan: *pan,
+-                        size: *size,
+-                        land: fall.land,
+-                    });
+-                }
+-            }
+-            let mut buf = vec![0.0; per_frame * 2];
+-            clatter.render(&mut buf, 0.6);
+-            out.extend(buf);
+-        }
+-        out
+-    }
+-
+-    fn write_wav(path: &str, out: &[f32]) {
+-        let rate = 48_000u32;
+-        let mut wav = Vec::new();
+-        let data_len = (out.len() * 2) as u32;
+-        wav.extend_from_slice(b"RIFF");
+-        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+-        wav.extend_from_slice(b"WAVEfmt ");
+-        wav.extend_from_slice(&16u32.to_le_bytes());
+-        wav.extend_from_slice(&[1, 0, 2, 0]);
+-        wav.extend_from_slice(&rate.to_le_bytes());
+-        wav.extend_from_slice(&(rate * 4).to_le_bytes());
+-        wav.extend_from_slice(&[4, 0, 16, 0]);
+-        wav.extend_from_slice(b"data");
+-        wav.extend_from_slice(&data_len.to_le_bytes());
+-        for s in out {
+-            wav.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+-        }
+-        std::fs::write(path, wav).unwrap();
+-    }
+-
+-    /// Renders a start-up of a board like the default one to the WAV file
+-    /// named by `CLATTER_WAV`, to hear what it sounds like.
+-    #[test]
+-    #[ignore]
+-    fn render_a_start_up() {
+-        let path = std::env::var("CLATTER_WAV").expect("set CLATTER_WAV to a path");
+-        write_wav(&path, &render_board(6.0, &[]));
+-    }
+-
+-    /// Renders an alarm going off, the board's clatter and three chimes, to
+-    /// the WAV file named by `ALARM_WAV`.
+-    #[test]
+-    #[ignore]
+-    fn render_an_alarm() {
+-        let path = std::env::var("ALARM_WAV").expect("set ALARM_WAV to a path");
+-        write_wav(&path, &render_board(12.5, &[0.3, 4.3, 8.3]));
+-    }
+-}
