@@ -1,0 +1,19 @@
+[package]
+name = "splitflap"
+version = "0.1.0"
+edition.workspace = true
+description = "Split-flap cards, drums, clatter and lamps for egui: the look shared by Split-Flap Clock and Now Boarding"
+publish = false
+
+[dependencies]
+egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+cpal = "0.18"
+rtrb = "0.4"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+
+[[example]]
+name = "gallery"
