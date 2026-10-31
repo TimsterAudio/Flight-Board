@@ -12,13 +12,13 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::clock::Clock;
-use crate::model::{BoardQuery, Movement};
-use crate::provider::{Error, Provider};
+use crate::model::BoardQuery;
+use crate::provider::{Answer, Error, Provider};
 
 /// What a poll brought back, and the board's time it was asked at.
 pub struct Update {
     pub at: DateTime<Utc>,
-    pub result: Result<Vec<Movement>, Error>,
+    pub result: Result<Answer, Error>,
 }
 
 pub struct Poller {
@@ -134,7 +134,7 @@ mod tests {
             || {},
         );
         let u = p.updates.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(!u.result.unwrap().is_empty());
+        assert!(!u.result.unwrap().movements.is_empty());
         drop(p);
     }
 }

@@ -10,8 +10,10 @@ The brief's build plan, with what's been added along the way.
 - [x] **Phase 1**: the `splitflap` crate, the gallery, the clock on the crate.
 - [x] **Phase 2**: the board app with the demo feed: settings, normaliser,
   paging, row shifting, crowd clatter, the three layouts.
-- [ ] **Phase 3**: PTV for Southern Cross: key store, station search, polling,
-  cache on disk, stale handling, attribution.
+- [x] **Phase 3**: PTV for Southern Cross: key store, station search, polling,
+  cache on disk, stale handling, attribution. Still to do with the owner's
+  key: record the PTV fixture, and watch the board beside PTV's own for an
+  hour.
 - [ ] **Phase 4**: FlightAware AeroAPI for MEL: polling budget, codeshare
   cycling, and **airline colour cards**: the airline's two-letter code on a
   card in the airline's colour, instead of a logo (see below).

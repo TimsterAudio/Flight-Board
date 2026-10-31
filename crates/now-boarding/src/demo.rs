@@ -10,7 +10,7 @@ use chrono_tz::Tz;
 use splitflap::rng::Rng;
 
 use crate::model::{BoardQuery, Direction, Mode, Movement, Place, Status};
-use crate::provider::{Provider, Result};
+use crate::provider::{Answer, Provider, Result};
 
 pub const AIRPORT: &str = "demo-airport";
 pub const STATION: &str = "demo-station";
@@ -352,7 +352,7 @@ impl Provider for Demo {
 
     /// Movements from an hour ago to eighteen hours ahead: yesterday's
     /// late ones and tomorrow's early ones included.
-    fn board(&self, q: &BoardQuery) -> Result<Vec<Movement>> {
+    fn board(&self, q: &BoardQuery) -> Result<Answer> {
         let now = q.now.with_timezone(&self.tz);
         let today = now.date_naive();
         let (from, to) = (now - Span::hours(1), now + Span::hours(18));
@@ -368,7 +368,10 @@ impl Provider for Demo {
                 }
             }
         }
-        Ok(out)
+        Ok(Answer {
+            movements: out,
+            notices: Vec::new(),
+        })
     }
 }
 
@@ -406,11 +409,14 @@ mod tests {
     fn the_same_day_comes_round_every_time() {
         let d = Demo::new(Tz::UTC);
         let q = query(Mode::Flight, Direction::Departure, noon());
-        assert_eq!(d.board(&q).unwrap(), d.board(&q).unwrap());
+        assert_eq!(
+            d.board(&q).unwrap().movements,
+            d.board(&q).unwrap().movements
+        );
         let other = query(Mode::Flight, Direction::Departure, noon() + Span::days(1));
         assert_ne!(
-            d.board(&q).unwrap()[0].numbers,
-            d.board(&other).unwrap()[0].numbers
+            d.board(&q).unwrap().movements[0].numbers,
+            d.board(&other).unwrap().movements[0].numbers
         );
     }
 
@@ -503,7 +509,8 @@ mod tests {
             let now = start + Span::minutes(minute);
             let ms = normalise(
                 d.board(&query(Mode::Flight, Direction::Departure, now))
-                    .unwrap(),
+                    .unwrap()
+                    .movements,
                 now,
             );
             if let Some(top) = before.first() {
@@ -564,7 +571,8 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 30, 23, 30, 0).unwrap();
         let b = d
             .board(&query(Mode::Train, Direction::Departure, now))
-            .unwrap();
+            .unwrap()
+            .movements;
         // Past midnight, tomorrow's first trains are there.
         assert!(b.iter().any(|m| m.scheduled.date_naive().day() == 31));
         assert!(b.iter().all(|m| m.time() >= now - Span::hours(1)));

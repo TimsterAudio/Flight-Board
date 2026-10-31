@@ -14,9 +14,10 @@ use splitflap::{Look, Style};
 
 use crate::clock::Clock;
 use crate::demo::{self, Demo};
-use crate::model::{Direction, Mode};
+use crate::model::{Direction, Feed, Mode, Place};
 use crate::normalise::{self, Spec};
 use crate::view::{Setup, View};
+use crate::{keys, ptv};
 
 mod settings;
 
@@ -76,6 +77,10 @@ pub struct Saved {
     pub chime_volume: f32,
     /// How fast the demo's day runs: 1 for real time.
     pub demo_speed: f64,
+    /// Where train boards' movements come from, and PTV's station. The
+    /// keys aren't here: they're in the system key store.
+    pub train_feed: Feed,
+    pub ptv_place: Option<Place>,
 }
 
 impl Default for Saved {
@@ -98,6 +103,8 @@ impl Default for Saved {
             chime: true,
             chime_volume: 0.7,
             demo_speed: 1.0,
+            train_feed: Feed::Demo,
+            ptv_place: None,
         }
     }
 }
@@ -122,17 +129,33 @@ impl Saved {
         specs
     }
 
+    /// Where this board's movements come from.
+    pub fn feed(&self) -> Feed {
+        match self.mode {
+            Mode::Flight => Feed::Demo,
+            Mode::Train => self.train_feed,
+        }
+    }
+
     /// The boards to show, in order: the main window's first.
     fn setups(&self) -> Vec<Setup> {
         let tz = demo::local_tz();
         let [airport, station] = Demo::places(tz.name());
-        let place = match self.mode {
-            Mode::Flight => airport,
-            Mode::Train => station,
+        let feed = self.feed();
+        let place = match (self.mode, feed) {
+            (_, Feed::Ptv) => self.ptv_place.clone().unwrap_or_else(|| Place {
+                id: "ptv:".into(),
+                name: "Choose a station".into(),
+                tz: "Australia/Melbourne".into(),
+            }),
+            (Mode::Flight, _) => airport,
+            (Mode::Train, _) => station,
         };
-        let directions = match self.layout {
-            Layout::One => vec![self.direction],
-            Layout::Stacked | Layout::TwoWindows => {
+        let directions = match (feed, self.layout) {
+            // PTV gives departures only.
+            (Feed::Ptv, _) => vec![Direction::Departure],
+            (_, Layout::One) => vec![self.direction],
+            (_, Layout::Stacked | Layout::TwoWindows) => {
                 vec![Direction::Departure, Direction::Arrival]
             }
         };
@@ -141,6 +164,7 @@ impl Saved {
             .map(|direction| Setup {
                 mode: self.mode,
                 direction,
+                feed,
                 place: place.clone(),
                 rows: self.rows.clamp(4, 30),
                 page_secs: self.page_secs.max(5) as f64,
@@ -166,10 +190,22 @@ pub struct Overrides {
     pub page_secs: Option<u32>,
     pub mood: Option<Mood>,
     pub settings: bool,
+    /// Trains from PTV, at a station given as `Name=0:1181,3:1544`.
+    pub ptv: bool,
+    pub ptv_place: Option<Place>,
 }
 
 pub struct App {
     saved: Saved,
+    /// PTV's developer ID and key, from the key store, and what went wrong
+    /// reading them, if anything; and a count that goes up when they change,
+    /// so the boards start again with them.
+    ptv_keys: Option<ptv::Keys>,
+    keys_error: Option<String>,
+    keys_changed: u64,
+    keys_applied: u64,
+    /// The PTV page of Settings: what's typed, what's going on.
+    ptv_form: settings::PtvForm,
     clock: Clock,
     views: Vec<View>,
     /// The lamps over each window.
@@ -191,6 +227,27 @@ pub struct App {
 fn beside(ctx: &egui::Context, across: f32) -> Option<egui::Pos2> {
     ctx.input(|i| i.viewport().outer_rect)
         .map(|r| egui::pos2(r.max.x + 12.0 + across, r.min.y))
+}
+
+/// A board for `setup`: the demo on the demo's `clock`, a live feed on the
+/// real time with its keys.
+fn make_view(
+    setup: Setup,
+    clock: Clock,
+    ctx: &egui::Context,
+    time: f64,
+    ptv_keys: &Option<ptv::Keys>,
+) -> View {
+    match setup.feed {
+        Feed::Demo => View::new(setup, clock, ctx, time, None),
+        Feed::Ptv => View::new(
+            setup,
+            Clock::starting(Utc::now(), 1.0),
+            ctx,
+            time,
+            ptv_keys.clone(),
+        ),
+    }
 }
 
 /// Today at `h`:`m` on the demo's clock, in UTC.
@@ -232,16 +289,32 @@ impl App {
         if let Some(v) = o.mood {
             saved.mood = v;
         }
+        if o.ptv {
+            saved.mode = Mode::Train;
+            saved.train_feed = Feed::Ptv;
+        }
+        if let Some(p) = o.ptv_place {
+            saved.ptv_place = Some(p);
+        }
+        let (ptv_keys, keys_error) = match keys::load_ptv() {
+            Ok(k) => (k, None),
+            Err(e) => (None, Some(e)),
+        };
         let start = o.start.map_or_else(Utc::now, |(h, m)| today_at(h, m));
         let clock = Clock::starting(start, saved.demo_speed);
         let time = cc.egui_ctx.input(|i| i.time);
         let views = saved
             .setups()
             .into_iter()
-            .map(|s| View::new(s, clock, &cc.egui_ctx, time))
+            .map(|s| make_view(s, clock, &cc.egui_ctx, time, &ptv_keys))
             .collect();
         Self {
             saved,
+            ptv_keys,
+            keys_error,
+            keys_changed: 0,
+            keys_applied: 0,
+            ptv_form: settings::PtvForm::default(),
             clock,
             views,
             lights: [Lighting::new(Rng::seeded()), Lighting::new(Rng::seeded())],
@@ -264,11 +337,13 @@ impl App {
         }
         let setups = self.saved.setups();
         let same = setups.len() == self.views.len()
-            && setups.iter().zip(&self.views).all(|(s, v)| *s == v.setup);
+            && setups.iter().zip(&self.views).all(|(s, v)| *s == v.setup)
+            && self.keys_applied == self.keys_changed;
         if !same {
+            self.keys_applied = self.keys_changed;
             self.views = setups
                 .into_iter()
-                .map(|s| View::new(s, self.clock, ctx, time))
+                .map(|s| make_view(s, self.clock, ctx, time, &self.ptv_keys))
                 .collect();
         }
     }

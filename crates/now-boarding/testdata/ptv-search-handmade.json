@@ -1,0 +1,10 @@
+{
+  "_comment": "Hand-written in the shape of a PTV v3 search answer, for tests. Not a recording.",
+  "stops": [
+    {"stop_id": 1181, "stop_name": "Southern Cross Station", "stop_suburb": "Melbourne City", "route_type": 0},
+    {"stop_id": 1544, "stop_name": "Southern Cross Railway Station", "stop_suburb": "Melbourne City", "route_type": 3},
+    {"stop_id": 18000, "stop_name": "Southern Cross Station/Spencer St", "stop_suburb": "Melbourne City", "route_type": 2}
+  ],
+  "routes": [],
+  "outlets": []
+}

@@ -1,0 +1,17 @@
+{
+  "_comment": "Hand-written in the shape of a PTV v3 stopping pattern, for tests. Not a recording.",
+  "departures": [
+    {"stop_id": 1181, "run_ref": "948001", "scheduled_departure_utc": "2026-10-30T07:05:00Z"},
+    {"stop_id": 1071, "run_ref": "948001", "scheduled_departure_utc": "2026-10-30T07:08:00Z"},
+    {"stop_id": 1162, "run_ref": "948001", "scheduled_departure_utc": "2026-10-30T07:12:00Z"},
+    {"stop_id": 1036, "run_ref": "948001", "scheduled_departure_utc": "2026-10-30T07:22:00Z"},
+    {"stop_id": 1073, "run_ref": "948001", "scheduled_departure_utc": "2026-10-30T08:05:00Z"}
+  ],
+  "stops": {
+    "1181": {"stop_id": 1181, "stop_name": "Southern Cross Station"},
+    "1071": {"stop_id": 1071, "stop_name": "Flinders Street Station"},
+    "1162": {"stop_id": 1162, "stop_name": "Richmond Station"},
+    "1036": {"stop_id": 1036, "stop_name": "Caulfield Station"},
+    "1073": {"stop_id": 1073, "stop_name": "Frankston Station"}
+  }
+}

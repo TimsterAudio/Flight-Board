@@ -4,13 +4,14 @@ A live airport and railway departures and arrivals board, drawn with
 split-flap cards: *Flight Board* or *Train Board*. Windows and Linux; Mac
 later. The design brief is [docs/BRIEF.md](docs/BRIEF.md).
 
-Work in progress: Phases 0 to 2 of the brief's build plan; see
+Work in progress: Phases 0 to 3 of the brief's build plan; see
 [TODO.md](TODO.md).
 
     cargo run --release -p now-boarding
 
 runs the board on its demo feed: no key, no network. Right-click or
-double-click it for Settings.
+double-click it for Settings. For live Victorian trains, give it your own PTV
+key there: see [docs/PHASE3.md](docs/PHASE3.md).
 
 ## What's here
 
@@ -43,7 +44,8 @@ rate after S seconds. `cpu_bench` times egui's share of a frame without a window
     cargo clippy --all-targets --target x86_64-pc-windows-gnu -- -D warnings
     cargo test
 
-On Linux, building needs ALSA's headers (`libasound2-dev`).
+On Linux, building needs ALSA's and D-Bus's headers (`libasound2-dev`,
+`libdbus-1-dev`, `pkg-config`).
 
 The board's typeface is Barlow Condensed SemiBold by The Barlow Project Authors, under the
 SIL Open Font License (`crates/splitflap/assets/OFL.txt`).

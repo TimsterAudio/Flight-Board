@@ -28,6 +28,26 @@ impl Direction {
     }
 }
 
+/// Where a board's movements come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Feed {
+    /// The built-in demo: no key, no network.
+    #[default]
+    Demo,
+    /// Public Transport Victoria's Timetable API, for Victoria's trains.
+    Ptv,
+}
+
+impl Feed {
+    /// A short name, for the cache's file names.
+    pub fn key(self) -> &'static str {
+        match self {
+            Feed::Demo => "demo",
+            Feed::Ptv => "ptv",
+        }
+    }
+}
+
 /// Where a movement is in its day, as a board says it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Status {

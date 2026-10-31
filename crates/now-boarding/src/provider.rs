@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use crate::model::{BoardQuery, Movement, Place};
 
-/// Why a provider couldn't answer. Only the live providers fail.
-#[allow(dead_code)]
+/// Why a provider couldn't answer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
     /// Too many requests: wait at least this long.
@@ -32,9 +31,49 @@ pub trait Provider: Send {
     fn attribution(&self) -> &str;
     /// The shortest wait between requests the provider's limits allow.
     fn min_interval(&self) -> Duration;
-    /// Airports or stations matching `text`, for the Settings' search
-    /// once there are live providers.
-    #[allow(dead_code)]
+    /// Airports or stations matching `text`.
     fn search(&self, text: &str) -> Result<Vec<Place>>;
-    fn board(&self, q: &BoardQuery) -> Result<Vec<Movement>>;
+    fn board(&self, q: &BoardQuery) -> Result<Answer>;
+}
+
+/// A board's worth from a provider: the movements, and any notices for the
+/// ticker, such as disruptions.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Answer {
+    pub movements: Vec<Movement>,
+    pub notices: Vec<String>,
+}
+
+/// A live feed with no key yet: it never reaches the network, and says why
+/// on the board.
+pub struct NoKey {
+    why: String,
+}
+
+impl NoKey {
+    pub fn new(why: &str) -> Self {
+        Self { why: why.into() }
+    }
+}
+
+impl Provider for NoKey {
+    fn name(&self) -> &str {
+        "no key"
+    }
+
+    fn attribution(&self) -> &str {
+        ""
+    }
+
+    fn min_interval(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+
+    fn search(&self, _: &str) -> Result<Vec<Place>> {
+        Err(Error::Failed(self.why.clone()))
+    }
+
+    fn board(&self, _: &BoardQuery) -> Result<Answer> {
+        Err(Error::Failed(self.why.clone()))
+    }
 }

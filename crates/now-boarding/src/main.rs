@@ -2,12 +2,17 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod cache;
 mod clock;
 mod demo;
+mod http;
+mod keys;
 mod model;
 mod normalise;
 mod poller;
 mod provider;
+mod ptv;
+mod task;
 mod view;
 
 use app::{Layout, Overrides};
@@ -23,6 +28,8 @@ use splitflap::lighting::Mood;
 ///   --rows N, --page SECONDS
 ///   --mood off|soft|warm|evening
 ///   --settings      open the settings at start
+///   --ptv           trains from PTV (the key comes from the key store)
+///   --ptv-place "Southern Cross=0:1181,3:1544"   PTV's station, by its stops
 fn overrides() -> Overrides {
     let mut o = Overrides::default();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,6 +52,13 @@ fn overrides() -> Overrides {
                 }
             }
             "--rows" => o.rows = value.parse().ok(),
+            "--ptv-place" => {
+                o.ptv_place = value.split_once('=').map(|(name, stops)| model::Place {
+                    id: format!("ptv:{stops}"),
+                    name: name.into(),
+                    tz: "Australia/Melbourne".into(),
+                })
+            }
             "--page" => o.page_secs = value.parse().ok(),
             "--mood" => {
                 o.mood = match value.as_str() {
@@ -62,6 +76,7 @@ fn overrides() -> Overrides {
                     "--arrivals" => o.direction = Some(Direction::Arrival),
                     "--departures" => o.direction = Some(Direction::Departure),
                     "--settings" => o.settings = true,
+                    "--ptv" => o.ptv = true,
                     other => eprintln!("now-boarding: ignoring {other}"),
                 }
             }

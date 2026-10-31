@@ -12,12 +12,15 @@ use splitflap::lighting::LightMap;
 use splitflap::rng::Rng;
 use splitflap::{Board, Column, Row, Style};
 
+use crate::cache;
 use crate::clock::Clock;
 use crate::demo::Demo;
-use crate::model::{BoardQuery, Direction, Mode, Movement, Place, Status};
+use crate::http::Net;
+use crate::model::{BoardQuery, Direction, Feed, Mode, Movement, Place, Status};
 use crate::normalise::{self, Field, Spec};
 use crate::poller::Poller;
-use crate::provider::Provider;
+use crate::provider::{NoKey, Provider};
+use crate::ptv::{self, Ptv};
 
 /// The title's and the time's big cards.
 const BIG: Vec2 = vec2(44.0, 64.0);
@@ -43,6 +46,7 @@ const FAILURES_SHOWN: u32 = 2;
 pub struct Setup {
     pub mode: Mode,
     pub direction: Direction,
+    pub feed: Feed,
     pub place: Place,
     pub rows: usize,
     /// Seconds each page shows, when there are more movements than rows.
@@ -74,6 +78,8 @@ pub struct View {
     poller: Poller,
     attribution: String,
     movements: Vec<Movement>,
+    /// The provider's notices, such as disruptions, for the ticker.
+    notices: Vec<String>,
     /// The board's time of the last good update, and failures since.
     updated: Option<DateTime<Utc>>,
     failures: u32,
@@ -93,19 +99,49 @@ fn cards_across(width: f32) -> usize {
 }
 
 impl View {
-    pub fn new(setup: Setup, clock: Clock, ctx: &Context, time: f64) -> Self {
+    /// A board for `setup`, on `clock`; `keys` are the live feed's, if it
+    /// needs them and they've been given.
+    pub fn new(
+        setup: Setup,
+        clock: Clock,
+        ctx: &Context,
+        time: f64,
+        keys: Option<ptv::Keys>,
+    ) -> Self {
         let tz: Tz = setup.place.tz.parse().unwrap_or(Tz::UTC);
-        let provider: Box<dyn Provider> = Box::new(Demo::new(tz));
+        let (provider, every): (Box<dyn Provider>, Duration) = match (setup.feed, keys) {
+            (Feed::Demo, _) => (
+                Box::new(Demo::new(tz)),
+                // Once a board minute, and at least every few seconds of
+                // real time.
+                Duration::from_secs_f64((60.0 / clock.speed().max(0.01)).clamp(1.0, 5.0)),
+            ),
+            (Feed::Ptv, Some(k)) => {
+                let mut p = Ptv::new(k, Box::new(Net::new()));
+                // In a debug build, a stand-in server can play PTV.
+                #[cfg(debug_assertions)]
+                if let Ok(base) = std::env::var("NOW_BOARDING_PTV_BASE") {
+                    p = p.with_base(&base);
+                }
+                (Box::new(p), ptv::EVERY)
+            }
+            (Feed::Ptv, None) => (
+                Box::new(NoKey::new("PTV NEEDS YOUR KEY: SEE SETTINGS")),
+                Duration::from_secs(60),
+            ),
+        };
         let attribution = provider.attribution().to_string();
+        // A live board starts from what it last knew.
+        let cached = match setup.feed {
+            Feed::Demo => None,
+            feed => cache::load(feed.key(), &setup.place, setup.direction),
+        };
         let query = BoardQuery {
             place: setup.place.clone(),
             mode: setup.mode,
             direction: setup.direction,
             now: clock.now(),
         };
-        // The demo asks once a board minute, and at least every few
-        // seconds of real time.
-        let every = Duration::from_secs_f64((60.0 / clock.speed().max(0.01)).clamp(1.0, 5.0));
         let wake = ctx.clone();
         let poller = Poller::start(provider, query, clock, every, move || {
             wake.request_repaint()
@@ -125,8 +161,9 @@ impl View {
             ticker: Board::new(vec![Column::text("", ticker_cards)], 1, time, Rng::seeded()),
             poller,
             attribution,
-            movements: Vec::new(),
-            updated: None,
+            movements: cached.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
+            notices: cached.as_ref().map(|c| c.2.clone()).unwrap_or_default(),
+            updated: cached.as_ref().map(|c| c.0),
             failures: 0,
             error: None,
             page: 0,
@@ -144,8 +181,19 @@ impl View {
         let mut out = Vec::new();
         while let Ok(u) = self.poller.updates.try_recv() {
             match u.result {
-                Ok(ms) => {
-                    let ms = normalise::normalise(ms, u.at);
+                Ok(answer) => {
+                    if self.setup.feed != Feed::Demo {
+                        cache::save(
+                            self.setup.feed.key(),
+                            &self.setup.place,
+                            self.setup.direction,
+                            u.at,
+                            &answer.movements,
+                            &answer.notices,
+                        );
+                    }
+                    self.notices = answer.notices;
+                    let ms = normalise::normalise(answer.movements, u.at);
                     if self.updated.is_some() {
                         for id in normalise::moved(&self.movements, &ms) {
                             self.blinks.push((id, time));
@@ -254,7 +302,8 @@ impl View {
 
     fn ticker_text(&self, ms: &[Movement]) -> String {
         let next = ms.iter().find(|m| !m.status.finished());
-        match (self.setup.mode, next) {
+        let notices: String = self.notices.iter().map(|n| format!("{n}.  ")).collect();
+        let text = match (self.setup.mode, next) {
             (Mode::Train, Some(m)) if !m.via.is_empty() => {
                 let (verb, end) = match self.setup.direction {
                     Direction::Departure => ("CALLING AT", m.place.as_str()),
@@ -268,11 +317,15 @@ impl View {
                     self.attribution
                 )
             }
+            // Nothing to show yet, and a reason: the reason.
+            _ if ms.is_empty() && self.error.is_some() => self.error.clone().unwrap_or_default(),
+            _ if self.attribution.is_empty() => format!("WELCOME TO {}.", self.setup.place.name),
             _ => format!(
                 "WELCOME TO {}.  {}.",
                 self.setup.place.name, self.attribution
             ),
-        }
+        };
+        format!("{notices}{text}")
     }
 
     /// The footer's line: when it was last updated, who the data is from,
@@ -281,17 +334,22 @@ impl View {
         let mut parts = Vec::new();
         if let Some(at) = self.updated {
             let t = at.with_timezone(&self.tz).format("%H:%M");
-            parts.push(if self.failures >= FAILURES_SHOWN {
-                format!("LAST UPDATED {t}")
+            if self.failures >= FAILURES_SHOWN {
+                parts.push(format!("LAST UPDATED {t}"));
+                if let Some(e) = &self.error {
+                    parts.push(e.to_uppercase());
+                }
             } else {
-                format!("UPDATED {t}")
-            });
+                parts.push(format!("UPDATED {t}"));
+            }
         } else if let Some(e) = &self.error {
             parts.push(e.to_uppercase());
         } else {
             parts.push("WAITING FOR THE FIRST UPDATE".into());
         }
-        parts.push(self.attribution.clone());
+        if !self.attribution.is_empty() {
+            parts.push(self.attribution.clone());
+        }
         if self.pages > 1 {
             parts.push(format!("PAGE {} OF {}", self.page + 1, self.pages));
         }

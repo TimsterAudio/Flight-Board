@@ -5,8 +5,12 @@ use egui::{vec2, RichText, Ui, ViewportBuilder, ViewportId};
 use splitflap::lighting::{Failures, Mood};
 
 use super::{widths_key, App, Layout};
-use crate::model::{Direction, Mode};
-use crate::normalise;
+use crate::http::Net;
+use crate::model::{Direction, Feed, Mode, Place};
+use crate::provider::Provider;
+use crate::ptv::{self, Ptv};
+use crate::task::Task;
+use crate::{keys, normalise};
 
 /// The page turns on offer, in seconds.
 const PAGE_TURNS: [(u32, &str); 7] = [
@@ -25,6 +29,30 @@ const MOODS: [(Mood, &str); 4] = [
     (Mood::Warm, "Warm"),
     (Mood::Evening, "Evening"),
 ];
+
+const PTV_CREDIT: &str = "Train times for Victoria come from Public Transport Victoria's \
+Timetable API, licensed under Creative Commons Attribution 4.0. \
+Now Boarding is not made or endorsed by PTV.";
+
+const PTV_STEPS: &str = "1. Ask PTV for a Timetable API key: the way to ask is on \
+ptv.vic.gov.au, under Data and reporting, Datasets, PTV Timetable API. It's free.\n\
+2. PTV sends back a developer ID (a number) and a key (letters and numbers in groups).\n\
+3. Paste both here and press Save. They go into your computer's key store, \
+nowhere else.\n\
+4. Press Test, then search for your station.";
+
+/// What's typed on the PTV page, and the jobs it has running.
+#[derive(Default)]
+pub struct PtvForm {
+    devid: String,
+    key: String,
+    /// What the last save, test or search said.
+    said: Option<Result<String, String>>,
+    test: Option<Task<Result<String, String>>>,
+    search_text: String,
+    search: Option<Task<Result<Vec<Place>, String>>>,
+    found: Vec<Place>,
+}
 
 const ABOUT: &str = "Now Boarding shows departures and arrivals to look at, for personal use. \
 Data can be late or wrong: always check with the airline or the operator. \
@@ -85,11 +113,23 @@ impl App {
             "Departures and arrivals, in a window each",
         );
         ui.add_space(4.0);
-        ui.label(match s.mode {
-            Mode::Flight => "Feed: the demo airport, Gate 05 International.",
-            Mode::Train => "Feed: the demo station, Harbour Street.",
-        });
-        ui.label(RichText::new("Live feeds, with your own key, come next.").weak());
+        match s.mode {
+            Mode::Flight => {
+                ui.label("Feed: the demo airport, Gate 05 International.");
+                ui.label(RichText::new("Live flights, with your own key, come next.").weak());
+            }
+            Mode::Train => {
+                ui.horizontal(|ui| {
+                    ui.label("Feed");
+                    ui.selectable_value(&mut s.train_feed, Feed::Demo, "Demo: Harbour Street");
+                    ui.selectable_value(&mut s.train_feed, Feed::Ptv, "PTV: Victoria's trains");
+                });
+            }
+        }
+        if s.feed() == Feed::Ptv {
+            self.ptv_page(ui);
+        }
+        let s = &mut self.saved;
 
         heading(ui, "Rows and pages");
         ui.add(egui::Slider::new(&mut s.rows, 8..=24).text("rows on the board"));
@@ -216,6 +256,8 @@ impl App {
         heading(ui, "About");
         ui.label(ABOUT);
         ui.add_space(4.0);
+        ui.label(PTV_CREDIT);
+        ui.add_space(4.0);
         ui.label(
             RichText::new(format!("Now Boarding {}", env!("CARGO_PKG_VERSION")))
                 .weak()
@@ -223,4 +265,193 @@ impl App {
         );
         ui.add_space(vec2(0.0, 12.0).y);
     }
+}
+
+impl App {
+    /// The PTV page: the key, a test, and the station.
+    fn ptv_page(&mut self, ui: &mut Ui) {
+        heading(ui, "PTV: your key");
+        // Jobs that have finished.
+        if let Some(r) = self.ptv_form.test.as_ref().and_then(Task::take) {
+            self.ptv_form.said = Some(r);
+            self.ptv_form.test = None;
+        }
+        if let Some(r) = self.ptv_form.search.as_ref().and_then(Task::take) {
+            match r {
+                Ok(found) => {
+                    self.ptv_form.said = Some(Ok(match found.len() {
+                        0 => "No stations found by that name.".into(),
+                        1 => "Found one station.".into(),
+                        n => format!("Found {n} stations."),
+                    }));
+                    self.ptv_form.found = found;
+                }
+                Err(e) => self.ptv_form.said = Some(Err(e)),
+            }
+            self.ptv_form.search = None;
+        }
+
+        match (&self.ptv_keys, &self.keys_error) {
+            (Some(k), _) => {
+                ui.label(format!("Saved in the key store: developer ID {}.", k.devid));
+            }
+            (None, Some(e)) => {
+                ui.label(PTV_STEPS);
+                ui.label(RichText::new(format!("The key store can't be read: {e}")).weak());
+            }
+            (None, None) => {
+                ui.label(PTV_STEPS);
+            }
+        }
+        let form = &mut self.ptv_form;
+        egui::Grid::new("ptv key").num_columns(2).show(ui, |ui| {
+            ui.label("Developer ID");
+            ui.add(egui::TextEdit::singleline(&mut form.devid).desired_width(200.0));
+            ui.end_row();
+            ui.label("Key");
+            ui.add(
+                egui::TextEdit::singleline(&mut form.key)
+                    .password(true)
+                    .desired_width(320.0),
+            );
+            ui.end_row();
+        });
+        let typed =
+            (!form.devid.trim().is_empty() && !form.key.trim().is_empty()).then(|| ptv::Keys {
+                devid: form.devid.trim().to_string(),
+                key: form.key.trim().to_string(),
+            });
+        // What a test or a search uses: what's typed, or else what's saved.
+        let using = typed.clone().or_else(|| self.ptv_keys.clone());
+        let busy = self.ptv_form.test.is_some() || self.ptv_form.search.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(typed.is_some(), egui::Button::new("Save"))
+                .on_hover_text("Into your computer's key store")
+                .clicked()
+            {
+                if let Some(k) = &typed {
+                    match keys::save_ptv(k) {
+                        Ok(()) => {
+                            self.ptv_keys = Some(k.clone());
+                            self.keys_error = None;
+                            self.keys_changed += 1;
+                            self.ptv_form.devid.clear();
+                            self.ptv_form.key.clear();
+                            self.ptv_form.said = Some(Ok("Saved.".into()));
+                        }
+                        Err(e) => {
+                            self.ptv_form.said =
+                                Some(Err(format!("The key store wouldn't take it: {e}")));
+                        }
+                    }
+                }
+            }
+            if ui
+                .add_enabled(using.is_some() && !busy, egui::Button::new("Test"))
+                .on_hover_text("Asks PTV for a station, to see the key works")
+                .clicked()
+            {
+                if let Some(k) = using.clone() {
+                    self.ptv_form.said = None;
+                    self.ptv_form.test = Some(Task::start(ui.ctx(), move || {
+                        let p = ptv_provider(k);
+                        match p.search("Southern Cross") {
+                            Ok(_) => Ok("The key works.".to_string()),
+                            Err(e) => Err(format!("It didn't work: {e}")),
+                        }
+                    }));
+                }
+            }
+            if self.ptv_keys.is_some()
+                && ui
+                    .button("Forget")
+                    .on_hover_text("Takes the key out of the key store")
+                    .clicked()
+            {
+                match keys::forget_ptv() {
+                    Ok(()) => {
+                        self.ptv_keys = None;
+                        self.keys_changed += 1;
+                        self.ptv_form.said = Some(Ok("Forgotten.".into()));
+                    }
+                    Err(e) => self.ptv_form.said = Some(Err(e)),
+                }
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+
+        heading(ui, "PTV: your station");
+        ui.label(match &self.saved.ptv_place {
+            Some(p) => format!("The board shows departures from {}.", p.name),
+            None => "Search for a station, then choose it.".into(),
+        });
+        let mut go = false;
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.ptv_form.search_text)
+                    .hint_text("such as Southern Cross")
+                    .desired_width(220.0),
+            );
+            go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            go |= ui
+                .add_enabled(using.is_some() && !busy, egui::Button::new("Search"))
+                .clicked();
+        });
+        if go && !busy {
+            if let Some(k) = using {
+                let text = self.ptv_form.search_text.clone();
+                self.ptv_form.said = None;
+                self.ptv_form.search = Some(Task::start(ui.ctx(), move || {
+                    ptv_provider(k).search(&text).map_err(|e| e.to_string())
+                }));
+            }
+        }
+        let mut chosen = None;
+        for p in &self.ptv_form.found {
+            let here = self.saved.ptv_place.as_ref().is_some_and(|c| c.id == p.id);
+            let lines = ptv::stops(p)
+                .iter()
+                .map(|(t, _)| if *t == 3 { "V/Line" } else { "metro" })
+                .collect::<Vec<_>>()
+                .join(" and ");
+            if ui
+                .selectable_label(here, format!("{}  ({lines})", p.name))
+                .clicked()
+            {
+                chosen = Some(p.clone());
+            }
+        }
+        if let Some(p) = chosen {
+            self.saved.ptv_place = Some(p);
+        }
+        match &self.ptv_form.said {
+            Some(Ok(m)) => {
+                ui.label(m.as_str());
+            }
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().warn_fg_color, e.as_str());
+            }
+            None => {}
+        }
+        ui.label(
+            RichText::new(
+                "PTV gives departures only, so the board shows departures. It asks once a minute.",
+            )
+            .weak(),
+        );
+    }
+}
+
+/// PTV, with keys `k`, for a Settings job; a stand-in server in a debug
+/// build if one is set.
+fn ptv_provider(k: ptv::Keys) -> Ptv {
+    let p = Ptv::new(k, Box::new(Net::new()));
+    #[cfg(debug_assertions)]
+    if let Ok(base) = std::env::var("NOW_BOARDING_PTV_BASE") {
+        return p.with_base(&base);
+    }
+    p
 }
