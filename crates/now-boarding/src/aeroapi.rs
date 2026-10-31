@@ -253,6 +253,8 @@ impl AeroApi {
     }
 
     /// Asks somewhere else than FlightAware, such as a stand-in server.
+    // Only debug builds' stand-in servers use this.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fn with_base(mut self, base: &str) -> Self {
         self.base = base.trim_end_matches('/').to_string();
         self
