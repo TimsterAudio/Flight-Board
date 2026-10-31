@@ -1,12 +1,16 @@
 // No console window on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod aeroapi;
+mod airlines;
+mod airports;
 mod app;
 mod cache;
 mod clock;
 mod demo;
 mod http;
 mod keys;
+mod logos;
 mod model;
 mod normalise;
 mod poller;
@@ -28,6 +32,8 @@ use splitflap::lighting::Mood;
 ///   --rows N, --page SECONDS
 ///   --mood off|soft|warm|evening
 ///   --settings      open the settings at start
+///   --aeroapi       flights from AeroAPI (the key comes from the key store)
+///   --airport MEL   AeroAPI's airport, by its code
 ///   --ptv           trains from PTV (the key comes from the key store)
 ///   --ptv-place "Southern Cross=0:1181,3:1544"   PTV's station, by its stops
 fn overrides() -> Overrides {
@@ -52,6 +58,7 @@ fn overrides() -> Overrides {
                 }
             }
             "--rows" => o.rows = value.parse().ok(),
+            "--airport" => o.airport = Some(value.clone()),
             "--ptv-place" => {
                 o.ptv_place = value.split_once('=').map(|(name, stops)| model::Place {
                     id: format!("ptv:{stops}"),
@@ -77,6 +84,7 @@ fn overrides() -> Overrides {
                     "--departures" => o.direction = Some(Direction::Departure),
                     "--settings" => o.settings = true,
                     "--ptv" => o.ptv = true,
+                    "--aeroapi" => o.aeroapi = true,
                     other => eprintln!("now-boarding: ignoring {other}"),
                 }
             }

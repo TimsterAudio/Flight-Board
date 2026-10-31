@@ -18,6 +18,8 @@ use crate::provider::{Answer, Error, Provider};
 /// What a poll brought back, and the board's time it was asked at.
 pub struct Update {
     pub at: DateTime<Utc>,
+    /// How long until the next poll.
+    pub wait: Duration,
     pub result: Result<Answer, Error>,
 }
 
@@ -74,7 +76,7 @@ impl Poller {
                             back_off(every, failures)
                         }
                     };
-                    if tx.send(Update { at, result }).is_err() {
+                    if tx.send(Update { at, wait, result }).is_err() {
                         return;
                     }
                     wake();

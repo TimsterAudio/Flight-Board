@@ -2,6 +2,8 @@
 //! the sound.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use egui::{vec2, Color32, Rect, Sense, Ui, ViewportBuilder, ViewportCommand, ViewportId};
@@ -12,12 +14,17 @@ use splitflap::rng::Rng;
 use splitflap::sound::{Click, Crowd, Sound};
 use splitflap::{Look, Style};
 
+use crate::aeroapi::{AeroApi, Budget, Spent};
 use crate::clock::Clock;
 use crate::demo::{self, Demo};
+use crate::http::Net;
+use crate::logos::Logos;
 use crate::model::{Direction, Feed, Mode, Place};
-use crate::normalise::{self, Spec};
+use crate::normalise::{self, Operators, Spec};
+use crate::provider::{NoKey, Provider};
+use crate::ptv::Ptv;
 use crate::view::{Setup, View};
-use crate::{keys, ptv};
+use crate::{airports, keys, ptv};
 
 mod settings;
 
@@ -81,6 +88,15 @@ pub struct Saved {
     /// keys aren't here: they're in the system key store.
     pub train_feed: Feed,
     pub ptv_place: Option<Place>,
+    /// Where flight boards' movements come from, the airport, and
+    /// AeroAPI's budget and what's been spent of it this month.
+    pub flight_feed: Feed,
+    pub airport: Place,
+    pub budget: Budget,
+    pub spent: Spent,
+    /// Airline colour cards, and colours set here, by airline code.
+    pub colour_cards: bool,
+    pub airline_colours: Vec<(String, [u8; 3])>,
 }
 
 impl Default for Saved {
@@ -105,6 +121,12 @@ impl Default for Saved {
             demo_speed: 1.0,
             train_feed: Feed::Demo,
             ptv_place: None,
+            flight_feed: Feed::Demo,
+            airport: airports::melbourne(),
+            budget: Budget::default(),
+            spent: Spent::default(),
+            colour_cards: true,
+            airline_colours: Vec::new(),
         }
     }
 }
@@ -129,10 +151,21 @@ impl Saved {
         specs
     }
 
+    /// How many AeroAPI boards share the budget.
+    pub fn aero_boards(&self) -> u32 {
+        if self.feed() != Feed::AeroApi {
+            return 0;
+        }
+        match self.layout {
+            Layout::One => 1,
+            _ => 2,
+        }
+    }
+
     /// Where this board's movements come from.
     pub fn feed(&self) -> Feed {
         match self.mode {
-            Mode::Flight => Feed::Demo,
+            Mode::Flight => self.flight_feed,
             Mode::Train => self.train_feed,
         }
     }
@@ -143,6 +176,7 @@ impl Saved {
         let [airport, station] = Demo::places(tz.name());
         let feed = self.feed();
         let place = match (self.mode, feed) {
+            (_, Feed::AeroApi) => self.airport.clone(),
             (_, Feed::Ptv) => self.ptv_place.clone().unwrap_or_else(|| Place {
                 id: "ptv:".into(),
                 name: "Choose a station".into(),
@@ -193,6 +227,9 @@ pub struct Overrides {
     /// Trains from PTV, at a station given as `Name=0:1181,3:1544`.
     pub ptv: bool,
     pub ptv_place: Option<Place>,
+    /// Flights from AeroAPI, at an airport found by its code.
+    pub aeroapi: bool,
+    pub airport: Option<String>,
 }
 
 pub struct App {
@@ -206,6 +243,16 @@ pub struct App {
     keys_applied: u64,
     /// The PTV page of Settings: what's typed, what's going on.
     ptv_form: settings::PtvForm,
+    /// The AeroAPI key, from the key store, and what went wrong reading it.
+    aero_key: Option<String>,
+    aero_error: Option<String>,
+    /// AeroAPI pages paid for this month, shared with the boards' pollers,
+    /// and the budget the boards were made with.
+    spent: Arc<Mutex<Spent>>,
+    budget_applied: Budget,
+    aero_form: settings::AeroForm,
+    /// Airline logos the user has added.
+    logos: Logos,
     clock: Clock,
     views: Vec<View>,
     /// The lamps over each window.
@@ -229,25 +276,67 @@ fn beside(ctx: &egui::Context, across: f32) -> Option<egui::Pos2> {
         .map(|r| egui::pos2(r.max.x + 12.0 + across, r.min.y))
 }
 
+/// What a live board needs to start: keys, and AeroAPI's budget.
+struct Live {
+    ptv: Option<ptv::Keys>,
+    aero: Option<String>,
+    budget: Budget,
+    spent: Arc<Mutex<Spent>>,
+    /// AeroAPI boards sharing the budget.
+    aero_boards: u32,
+}
+
 /// A board for `setup`: the demo on the demo's `clock`, a live feed on the
-/// real time with its keys.
-fn make_view(
-    setup: Setup,
-    clock: Clock,
-    ctx: &egui::Context,
-    time: f64,
-    ptv_keys: &Option<ptv::Keys>,
-) -> View {
-    match setup.feed {
-        Feed::Demo => View::new(setup, clock, ctx, time, None),
-        Feed::Ptv => View::new(
-            setup,
-            Clock::starting(Utc::now(), 1.0),
-            ctx,
-            time,
-            ptv_keys.clone(),
+/// real time with its keys; with no key, a board that says so.
+fn make_view(setup: Setup, clock: Clock, ctx: &egui::Context, time: f64, live: &Live) -> View {
+    let real = Clock::starting(Utc::now(), 1.0);
+    let tz: chrono_tz::Tz = setup.place.tz.parse().unwrap_or(chrono_tz::Tz::UTC);
+    let (provider, every, clock): (Box<dyn Provider>, Duration, Clock) = match setup.feed {
+        Feed::Demo => (
+            Box::new(Demo::new(tz)),
+            // Once a board minute, and at least every few seconds.
+            Duration::from_secs_f64((60.0 / clock.speed().max(0.01)).clamp(1.0, 5.0)),
+            clock,
         ),
-    }
+        Feed::Ptv => match &live.ptv {
+            Some(k) => {
+                let p = Ptv::new(k.clone(), Box::new(Net::new()));
+                #[cfg(debug_assertions)]
+                let p = match std::env::var("NOW_BOARDING_PTV_BASE") {
+                    Ok(base) => p.with_base(&base),
+                    Err(_) => p,
+                };
+                (Box::new(p), ptv::EVERY, real)
+            }
+            None => (
+                Box::new(NoKey::new("PTV NEEDS YOUR KEY: SEE SETTINGS")),
+                Duration::from_secs(60),
+                real,
+            ),
+        },
+        Feed::AeroApi => match &live.aero {
+            Some(k) => {
+                let p = AeroApi::new(
+                    k.clone(),
+                    live.budget.clone(),
+                    live.spent.clone(),
+                    Box::new(Net::new()),
+                );
+                #[cfg(debug_assertions)]
+                let p = match std::env::var("NOW_BOARDING_AEROAPI_BASE") {
+                    Ok(base) => p.with_base(&base),
+                    Err(_) => p,
+                };
+                (Box::new(p), live.budget.interval(live.aero_boards), real)
+            }
+            None => (
+                Box::new(NoKey::new("AEROAPI NEEDS YOUR KEY: SEE SETTINGS")),
+                Duration::from_secs(60),
+                real,
+            ),
+        },
+    };
+    View::new(setup, clock, ctx, time, provider, every)
 }
 
 /// Today at `h`:`m` on the demo's clock, in UTC.
@@ -296,9 +385,33 @@ impl App {
         if let Some(p) = o.ptv_place {
             saved.ptv_place = Some(p);
         }
+        if o.aeroapi {
+            saved.mode = Mode::Flight;
+            saved.flight_feed = Feed::AeroApi;
+        }
+        if let Some(code) = &o.airport {
+            if let Some(p) = airports::search(code, demo::local_tz().name())
+                .into_iter()
+                .next()
+            {
+                saved.airport = p;
+            }
+        }
         let (ptv_keys, keys_error) = match keys::load_ptv() {
             Ok(k) => (k, None),
             Err(e) => (None, Some(e)),
+        };
+        let (aero_key, aero_error) = match keys::load_aeroapi() {
+            Ok(k) => (k, None),
+            Err(e) => (None, Some(e)),
+        };
+        let spent = Arc::new(Mutex::new(saved.spent.clone()));
+        let live = Live {
+            ptv: ptv_keys.clone(),
+            aero: aero_key.clone(),
+            budget: saved.budget.clone(),
+            spent: spent.clone(),
+            aero_boards: saved.aero_boards(),
         };
         let start = o.start.map_or_else(Utc::now, |(h, m)| today_at(h, m));
         let clock = Clock::starting(start, saved.demo_speed);
@@ -306,10 +419,16 @@ impl App {
         let views = saved
             .setups()
             .into_iter()
-            .map(|s| make_view(s, clock, &cc.egui_ctx, time, &ptv_keys))
+            .map(|s| make_view(s, clock, &cc.egui_ctx, time, &live))
             .collect();
         Self {
+            budget_applied: saved.budget.clone(),
             saved,
+            aero_key,
+            aero_error,
+            spent,
+            aero_form: settings::AeroForm::default(),
+            logos: Logos::default(),
             ptv_keys,
             keys_error,
             keys_changed: 0,
@@ -338,13 +457,26 @@ impl App {
         let setups = self.saved.setups();
         let same = setups.len() == self.views.len()
             && setups.iter().zip(&self.views).all(|(s, v)| *s == v.setup)
-            && self.keys_applied == self.keys_changed;
+            && self.keys_applied == self.keys_changed
+            && self.budget_applied == self.saved.budget;
         if !same {
             self.keys_applied = self.keys_changed;
+            self.budget_applied = self.saved.budget.clone();
+            let live = self.live();
             self.views = setups
                 .into_iter()
-                .map(|s| make_view(s, self.clock, ctx, time, &self.ptv_keys))
+                .map(|s| make_view(s, self.clock, ctx, time, &live))
                 .collect();
+        }
+    }
+
+    fn live(&self) -> Live {
+        Live {
+            ptv: self.ptv_keys.clone(),
+            aero: self.aero_key.clone(),
+            budget: self.saved.budget.clone(),
+            spent: self.spent.clone(),
+            aero_boards: self.saved.aero_boards(),
         }
     }
 
@@ -543,8 +675,15 @@ impl eframe::App for App {
             }
         }
         let now = self.clock.now();
+        let logos = &mut self.logos;
+        let mut logo = |code: &str| logos.get(&ctx, code);
+        let mut ops = Operators {
+            colours: self.saved.colour_cards,
+            own: &self.saved.airline_colours,
+            logo: &mut logo,
+        };
         for v in &mut self.views {
-            v.show(time, now);
+            v.show(time, now, Some(&mut ops));
         }
 
         let main: Vec<usize> = match self.saved.layout {
@@ -605,6 +744,9 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(spent) = self.spent.lock() {
+            self.saved.spent = spent.clone();
+        }
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 
@@ -630,10 +772,10 @@ mod tests {
         let mut s = Saved::default();
         s.widths.insert(
             widths_key(Mode::Flight, Direction::Departure),
-            vec![5, 7, 20, 4, 12],
+            vec![5, 2, 5, 20, 4, 12],
         );
-        assert_eq!(s.specs(Mode::Flight, Direction::Departure)[2].cards, 20);
-        assert_eq!(s.specs(Mode::Flight, Direction::Arrival)[2].cards, 16);
+        assert_eq!(s.specs(Mode::Flight, Direction::Departure)[3].cards, 20);
+        assert_eq!(s.specs(Mode::Flight, Direction::Arrival)[3].cards, 16);
         // Widths for a different number of columns are ignored.
         s.widths
             .insert(widths_key(Mode::Train, Direction::Arrival), vec![1, 2]);

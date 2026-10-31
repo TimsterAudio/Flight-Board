@@ -1,0 +1,21 @@
+{
+  "_comment": "Hand-written in the shape of an AeroAPI v4 scheduled_arrivals answer, for tests. Not a recording.",
+  "num_pages": 1,
+  "scheduled_arrivals": [
+    {"ident": "ANZ123", "ident_iata": "NZ123", "fa_flight_id": "ANZ123-1761700000-schedule-0101", "operator_iata": "NZ", "codeshares_iata": [],
+     "cancelled": false, "diverted": false,
+     "origin": {"code_iata": "AKL", "name": "Auckland Intl", "city": "Auckland"},
+     "scheduled_in": "2026-10-30T07:05:00Z", "estimated_in": "2026-10-30T07:00:00Z", "actual_on": "2026-10-30T06:55:00Z", "actual_in": null,
+     "terminal_destination": "2", "status": "Landed / Taxiing", "type": "Airline"},
+    {"ident": "SIA227", "ident_iata": "SQ227", "fa_flight_id": "SIA227-1761700000-schedule-0102", "operator_iata": "SQ", "codeshares_iata": ["VA5227"],
+     "cancelled": false, "diverted": false,
+     "origin": {"code_iata": "SIN", "name": "Singapore Changi", "city": "Singapore"},
+     "scheduled_in": "2026-10-30T07:20:00Z", "estimated_in": "2026-10-30T07:20:00Z", "actual_on": null, "actual_in": null,
+     "terminal_destination": "2", "status": "En Route / On Time", "type": "Airline"},
+    {"ident": "QFA2", "ident_iata": "QF2", "fa_flight_id": "QFA2-1761700000-schedule-0103", "operator_iata": "QF", "codeshares_iata": [],
+     "cancelled": false, "diverted": true,
+     "origin": {"code_iata": "LHR", "name": "London Heathrow", "city": "London"},
+     "scheduled_in": "2026-10-30T07:40:00Z", "estimated_in": null, "actual_in": null,
+     "terminal_destination": "2", "status": "Diverted", "type": "Airline"}
+  ]
+}

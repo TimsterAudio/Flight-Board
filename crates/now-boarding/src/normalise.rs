@@ -20,6 +20,11 @@ pub enum Field {
     Time,
     /// The flight number, cycling through codeshares.
     Flight,
+    /// The airline's code on its own, for its colour card: the flight
+    /// number's first part, cycling with it.
+    Airline,
+    /// The flight number without the airline's code.
+    Number,
     /// Destination, or where an arrival comes from.
     Place,
     /// Gate or platform.
@@ -67,14 +72,16 @@ pub fn preset(mode: Mode, direction: Direction) -> Vec<Spec> {
     match (mode, direction) {
         (Mode::Flight, Direction::Departure) => vec![
             Spec::new(Time, "TIME", 5),
-            Spec::new(Flight, "FLIGHT", 7),
+            Spec::new(Airline, "FLIGHT", 2),
+            Spec::new(Number, "", 5),
             Spec::new(Place, "DESTINATION", 16),
             Spec::new(Stand, "GATE", 4),
             Spec::new(Remarks, "REMARKS", 12),
         ],
         (Mode::Flight, Direction::Arrival) => vec![
             Spec::new(Time, "TIME", 5),
-            Spec::new(Flight, "FLIGHT", 7),
+            Spec::new(Airline, "FLIGHT", 2),
+            Spec::new(Number, "", 5),
             Spec::new(Place, "FROM", 16),
             Spec::new(Expected, "EXPECTED", 5),
             Spec::new(Remarks, "REMARKS", 12),
@@ -125,6 +132,14 @@ pub fn cell(m: &Movement, field: Field, cycle: usize) -> String {
             0 => String::new(),
             n => m.numbers[cycle % n].clone(),
         },
+        Field::Airline => match m.numbers.len() {
+            0 => m.operator.clone(),
+            n => crate::airlines::code_of(&m.numbers[cycle % n]),
+        },
+        Field::Number => match m.numbers.len() {
+            0 => String::new(),
+            n => crate::airlines::number_of(&m.numbers[cycle % n]),
+        },
         Field::Place => m.place.clone(),
         Field::Stand => m.stand.clone().unwrap_or_default(),
         Field::Remarks => m.status.words().to_string(),
@@ -154,9 +169,32 @@ pub fn tab(m: &Movement) -> Option<Color32> {
     }
 }
 
+/// How airlines' cards look: their colours, from Settings and the
+/// built-in table, and any logos the user has added.
+pub struct Operators<'a> {
+    /// Colour cards at all.
+    pub colours: bool,
+    /// Colours set in Settings, by airline code.
+    pub own: &'a [(String, [u8; 3])],
+    /// The logo for an airline code, and its size, if the user has one.
+    pub logo: &'a mut dyn FnMut(&str) -> Option<(egui::TextureId, egui::Vec2)>,
+}
+
+/// The light card a logo sits on, and the letters on it while it flips.
+const LOGO_CARD: Color32 = Color32::from_rgb(242, 240, 234);
+const LOGO_INK: Color32 = Color32::from_rgb(30, 30, 28);
+
 /// The board's rows for `ms`. With `stale`, the remarks say SEE SCREENS:
-/// the board no longer knows.
-pub fn rows(ms: &[Movement], specs: &[Spec], cycle: usize, stale: bool) -> Vec<Row> {
+/// the board no longer knows. With `ops`, the airline column gets its
+/// colour card or logo.
+pub fn rows(
+    ms: &[Movement],
+    specs: &[Spec],
+    cycle: usize,
+    stale: bool,
+    mut ops: Option<&mut Operators>,
+) -> Vec<Row> {
+    let airline = specs.iter().position(|s| s.field == Field::Airline);
     ms.iter()
         .map(|m| {
             let cells: Vec<String> = specs
@@ -169,6 +207,17 @@ pub fn rows(ms: &[Movement], specs: &[Spec], cycle: usize, stale: bool) -> Vec<R
             let mut row = Row::new(&cells);
             if let Some(t) = tab(m).filter(|_| !stale) {
                 row = row.tab(t);
+            }
+            if let (Some(col), Some(ops)) = (airline, ops.as_deref_mut()) {
+                let code = cell(m, Field::Airline, cycle);
+                if let Some((tex, size)) = (ops.logo)(&code) {
+                    row = row.tile(col, LOGO_CARD, LOGO_INK).picture(col, tex, size);
+                } else if ops.colours {
+                    if let Some(c) = crate::airlines::colour(&code, ops.own) {
+                        let card = Color32::from_rgb(c[0], c[1], c[2]);
+                        row = row.tile(col, card, crate::airlines::ink(c));
+                    }
+                }
             }
             row
         })
@@ -285,19 +334,57 @@ mod tests {
     fn cells_say_what_a_board_says() {
         let m = flight("a", 9, 5, Status::FinalCall);
         let specs = preset(Mode::Flight, Direction::Departure);
-        let rows = rows(std::slice::from_ref(&m), &specs, 0, false);
+        let rows = rows(std::slice::from_ref(&m), &specs, 0, false, None);
         assert_eq!(
             rows[0].cells,
-            ["09:05", "NB 1", "Zürich", "5", "FINAL CALL"]
+            ["09:05", "NB", "1", "Zürich", "5", "FINAL CALL"]
         );
         assert_eq!(rows[0].tab, Some(YELLOW));
         // Codeshares take turns.
         assert_eq!(cell(&m, Field::Flight, 1), "GX 2001");
         assert_eq!(cell(&m, Field::Flight, 2), "NB 1");
         // Stale, the remarks give up.
-        let stale = super::rows(&[m], &specs, 0, true);
-        assert_eq!(stale[0].cells[4], "SEE SCREENS");
+        let stale = super::rows(std::slice::from_ref(&m), &specs, 0, true, None);
+        assert_eq!(stale[0].cells[5], "SEE SCREENS");
         assert_eq!(stale[0].tab, None);
+    }
+
+    #[test]
+    fn airlines_get_their_cards() {
+        let m = flight("a", 9, 5, Status::OnTime);
+        let specs = preset(Mode::Flight, Direction::Departure);
+        let mut no_logos = |_: &str| None;
+        let mut ops = Operators {
+            colours: true,
+            own: &[],
+            logo: &mut no_logos,
+        };
+        let r = rows(std::slice::from_ref(&m), &specs, 0, false, Some(&mut ops));
+        // NB is a demo airline: its colour card, on the airline column.
+        assert!(r[0].tiles.get(1).copied().flatten().is_some());
+        assert!(r[0].picture.is_none());
+        // Codeshares cycle the card with the number.
+        assert_eq!(cell(&m, Field::Airline, 1), "GX");
+        assert_eq!(cell(&m, Field::Number, 1), "2001");
+        // A logo wins over the colour.
+        let tex = egui::TextureId::User(7);
+        let mut logos = |code: &str| (code == "NB").then_some((tex, egui::vec2(100.0, 50.0)));
+        let mut ops = Operators {
+            colours: true,
+            own: &[],
+            logo: &mut logos,
+        };
+        let r = rows(std::slice::from_ref(&m), &specs, 0, false, Some(&mut ops));
+        assert_eq!(r[0].picture.map(|p| (p.0, p.1)), Some((1, tex)));
+        // Colour cards off, and no logo: the board's own card.
+        let mut none = |_: &str| None;
+        let mut ops = Operators {
+            colours: false,
+            own: &[],
+            logo: &mut none,
+        };
+        let r = rows(std::slice::from_ref(&m), &specs, 0, false, Some(&mut ops));
+        assert!(r[0].tiles.iter().all(Option::is_none));
     }
 
     #[test]

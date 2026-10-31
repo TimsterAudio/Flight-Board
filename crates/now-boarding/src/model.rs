@@ -36,6 +36,8 @@ pub enum Feed {
     Demo,
     /// Public Transport Victoria's Timetable API, for Victoria's trains.
     Ptv,
+    /// FlightAware's AeroAPI, for an airport's flights.
+    AeroApi,
 }
 
 impl Feed {
@@ -44,6 +46,7 @@ impl Feed {
         match self {
             Feed::Demo => "demo",
             Feed::Ptv => "ptv",
+            Feed::AeroApi => "aeroapi",
         }
     }
 }

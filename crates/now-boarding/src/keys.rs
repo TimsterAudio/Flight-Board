@@ -7,6 +7,7 @@ use crate::ptv;
 const SERVICE: &str = "now-boarding";
 const PTV_DEVID: &str = "ptv-devid";
 const PTV_KEY: &str = "ptv-key";
+const AEROAPI_KEY: &str = "aeroapi-key";
 
 fn entry(name: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, name).map_err(|e| e.to_string())
@@ -47,8 +48,32 @@ pub fn save_ptv(k: &ptv::Keys) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// The AeroAPI key, if it's been saved. In a debug build,
+/// `NOW_BOARDING_AEROAPI_KEY` can stand in; a release build ignores it.
+pub fn load_aeroapi() -> Result<Option<String>, String> {
+    #[cfg(debug_assertions)]
+    if let Ok(key) = std::env::var("NOW_BOARDING_AEROAPI_KEY") {
+        return Ok(Some(key));
+    }
+    read(AEROAPI_KEY)
+}
+
+pub fn save_aeroapi(key: &str) -> Result<(), String> {
+    entry(AEROAPI_KEY)?
+        .set_password(key.trim())
+        .map_err(|e| e.to_string())
+}
+
+pub fn forget_aeroapi() -> Result<(), String> {
+    forget(&[AEROAPI_KEY])
+}
+
 pub fn forget_ptv() -> Result<(), String> {
-    for name in [PTV_DEVID, PTV_KEY] {
+    forget(&[PTV_DEVID, PTV_KEY])
+}
+
+fn forget(names: &[&str]) -> Result<(), String> {
+    for &name in names {
         match entry(name)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
             Err(e) => return Err(e.to_string()),

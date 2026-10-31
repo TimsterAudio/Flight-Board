@@ -1,0 +1,30 @@
+{
+  "_comment": "Hand-written in the shape of an AeroAPI v4 scheduled_departures answer, for tests. Not a recording: replace with fixtures/aeroapi once recorded.",
+  "links": null,
+  "num_pages": 1,
+  "scheduled_departures": [
+    {"ident": "QFA401", "ident_icao": "QFA401", "ident_iata": "QF401", "fa_flight_id": "QFA401-1761700000-schedule-0001",
+     "operator": "QFA", "operator_iata": "QF", "flight_number": "401", "codeshares": ["AAL7365", "UAE5101"], "codeshares_iata": ["AA7365", "EK5101"],
+     "cancelled": false, "diverted": false,
+     "origin": {"code": "YMML", "code_iata": "MEL", "name": "Melbourne", "city": "Melbourne"},
+     "destination": {"code": "YSSY", "code_iata": "SYD", "name": "Sydney", "city": "Sydney"},
+     "scheduled_out": "2026-10-30T07:00:00Z", "estimated_out": "2026-10-30T07:02:00Z", "actual_out": null,
+     "scheduled_in": "2026-10-30T08:25:00Z", "estimated_in": "2026-10-30T08:27:00Z", "actual_in": null,
+     "gate_origin": "5", "gate_destination": "3", "terminal_origin": "1", "terminal_destination": "3", "status": "Scheduled", "type": "Airline"},
+    {"ident": "VOZ831", "ident_iata": "VA831", "fa_flight_id": "VOZ831-1761700000-schedule-0002", "operator_iata": "VA", "codeshares_iata": [],
+     "cancelled": false, "diverted": false,
+     "destination": {"code_iata": "BNE", "name": "Brisbane", "city": "Brisbane"},
+     "scheduled_out": "2026-10-30T07:10:00Z", "estimated_out": "2026-10-30T07:40:00Z", "actual_out": null,
+     "gate_origin": "11", "terminal_origin": "3", "status": "Scheduled / Delayed", "type": "Airline"},
+    {"ident": "JST508", "ident_iata": "JQ508", "fa_flight_id": "JST508-1761700000-schedule-0003", "operator_iata": "JQ", "codeshares_iata": [],
+     "cancelled": true, "diverted": false,
+     "destination": {"code_iata": "OOL", "name": "Gold Coast", "city": "Coolangatta"},
+     "scheduled_out": "2026-10-30T07:20:00Z", "estimated_out": null, "actual_out": null,
+     "gate_origin": "15", "terminal_origin": "4", "status": "Cancelled", "type": "Airline"},
+    {"ident": "ANZ124", "ident_iata": "NZ124", "fa_flight_id": "ANZ124-1761700000-schedule-0004", "operator_iata": "NZ", "codeshares_iata": [],
+     "cancelled": false, "diverted": false,
+     "destination": {"code_iata": "AKL", "name": "Auckland Intl", "city": "Auckland"},
+     "scheduled_out": "2026-10-30T06:45:00Z", "estimated_out": "2026-10-30T06:50:00Z", "actual_out": "2026-10-30T06:50:00Z",
+     "gate_origin": "9", "terminal_origin": "2", "status": "En Route / On Time", "type": "Airline"}
+  ]
+}

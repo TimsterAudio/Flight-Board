@@ -112,6 +112,9 @@ pub struct Row {
     /// A column whose cards have a lamp lit round them, as when a gate or
     /// platform changes.
     pub mark: Option<(usize, Color32)>,
+    /// A picture on column `col`'s cards, such as an airline's logo: shown
+    /// once the cards have landed, over them, as a picture flap.
+    pub picture: Option<(usize, egui::TextureId, Vec2)>,
 }
 
 impl Row {
@@ -129,6 +132,13 @@ impl Row {
 
     pub fn tab(mut self, tab: Color32) -> Self {
         self.tab = Some(tab);
+        self
+    }
+
+    /// Puts `picture`, `size` pixels, on column `col`'s cards once they've
+    /// landed, keeping its shape.
+    pub fn picture(mut self, col: usize, picture: egui::TextureId, size: Vec2) -> Self {
+        self.picture = Some((col, picture, size));
         self
     }
 
@@ -489,6 +499,36 @@ impl Board {
         painter.add(still);
         for (f, r, look) in by_hand {
             f.draw(ctx, painter, r, &font, &look);
+        }
+        // Pictures on cards that have landed, inset so the card's edge shows,
+        // with the split across them as on a picture flap.
+        let cols = self.columns.len();
+        for (i, line) in self.lines.iter().enumerate() {
+            let Some((col, tex, px)) = line.row.picture else {
+                continue;
+            };
+            let (Some(run), Some(cards)) = (runs.get(i * cols + col), line.flaps.get(col)) else {
+                continue;
+            };
+            if cards.iter().any(|f| f.busy(now)) {
+                continue;
+            }
+            let room = run.shrink2(vec2(run.height() * 0.12, run.height() * 0.1));
+            let k = (room.width() / px.x.max(1.0)).min(room.height() / px.y.max(1.0));
+            let inset = Rect::from_center_size(room.center(), px * k);
+            let tint = lit(inset.center(), Color32::WHITE);
+            painter.image(
+                tex,
+                inset,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                tint,
+            );
+            let gap = (run.height() * 0.025).max(1.0);
+            painter.rect_filled(
+                Rect::from_center_size(run.center(), vec2(run.width(), gap)),
+                0.0,
+                style.look.split,
+            );
         }
         // Lamps lit round cells.
         let mut row_y = if self.has_captions() { CAPTIONS } else { 0.0 };

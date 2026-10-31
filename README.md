@@ -4,14 +4,15 @@ A live airport and railway departures and arrivals board, drawn with
 split-flap cards: *Flight Board* or *Train Board*. Windows and Linux; Mac
 later. The design brief is [docs/BRIEF.md](docs/BRIEF.md).
 
-Work in progress: Phases 0 to 3 of the brief's build plan; see
+Work in progress: Phases 0 to 4 of the brief's build plan; see
 [TODO.md](TODO.md).
 
     cargo run --release -p now-boarding
 
 runs the board on its demo feed: no key, no network. Right-click or
-double-click it for Settings. For live Victorian trains, give it your own PTV
-key there: see [docs/PHASE3.md](docs/PHASE3.md).
+double-click it for Settings. For live Victorian trains or live flights, give it
+your own PTV or AeroAPI key there: see [docs/PHASE3.md](docs/PHASE3.md) and
+[docs/PHASE4.md](docs/PHASE4.md).
 
 ## What's here
 

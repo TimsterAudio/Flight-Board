@@ -525,9 +525,16 @@ mod tests {
                 }
             }
             changes += moved(&before, &ms).len();
-            let page = rows(&ms[..ms.len().min(15)], &specs, 0, false);
-            delayed += page.iter().filter(|r| r.cells[4] == "DELAYED").count();
-            cancelled += page.iter().filter(|r| r.cells[4] == "CANCELLED").count();
+            let page = rows(&ms[..ms.len().min(15)], &specs, 0, false, None);
+            let remarks = specs.len() - 1;
+            delayed += page
+                .iter()
+                .filter(|r| r.cells[remarks] == "DELAYED")
+                .count();
+            cancelled += page
+                .iter()
+                .filter(|r| r.cells[remarks] == "CANCELLED")
+                .count();
             // Every row's cells fit the drums.
             for r in &page {
                 assert_eq!(r.cells.len(), specs.len());

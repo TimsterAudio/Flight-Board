@@ -14,13 +14,10 @@ use splitflap::{Board, Column, Row, Style};
 
 use crate::cache;
 use crate::clock::Clock;
-use crate::demo::Demo;
-use crate::http::Net;
 use crate::model::{BoardQuery, Direction, Feed, Mode, Movement, Place, Status};
-use crate::normalise::{self, Field, Spec};
+use crate::normalise::{self, Field, Operators, Spec};
 use crate::poller::Poller;
-use crate::provider::{NoKey, Provider};
-use crate::ptv::{self, Ptv};
+use crate::provider::Provider;
 
 /// The title's and the time's big cards.
 const BIG: Vec2 = vec2(44.0, 64.0);
@@ -80,6 +77,9 @@ pub struct View {
     movements: Vec<Movement>,
     /// The provider's notices, such as disruptions, for the ticker.
     notices: Vec<String>,
+    /// When the next update is due, on the board's clock: a live board's
+    /// footer says.
+    next: Option<DateTime<Utc>>,
     /// The board's time of the last good update, and failures since.
     updated: Option<DateTime<Utc>>,
     failures: u32,
@@ -99,37 +99,17 @@ fn cards_across(width: f32) -> usize {
 }
 
 impl View {
-    /// A board for `setup`, on `clock`; `keys` are the live feed's, if it
-    /// needs them and they've been given.
+    /// A board for `setup`, on `clock`, its movements from `provider`
+    /// every `every`.
     pub fn new(
         setup: Setup,
         clock: Clock,
         ctx: &Context,
         time: f64,
-        keys: Option<ptv::Keys>,
+        provider: Box<dyn Provider>,
+        every: Duration,
     ) -> Self {
         let tz: Tz = setup.place.tz.parse().unwrap_or(Tz::UTC);
-        let (provider, every): (Box<dyn Provider>, Duration) = match (setup.feed, keys) {
-            (Feed::Demo, _) => (
-                Box::new(Demo::new(tz)),
-                // Once a board minute, and at least every few seconds of
-                // real time.
-                Duration::from_secs_f64((60.0 / clock.speed().max(0.01)).clamp(1.0, 5.0)),
-            ),
-            (Feed::Ptv, Some(k)) => {
-                let mut p = Ptv::new(k, Box::new(Net::new()));
-                // In a debug build, a stand-in server can play PTV.
-                #[cfg(debug_assertions)]
-                if let Ok(base) = std::env::var("NOW_BOARDING_PTV_BASE") {
-                    p = p.with_base(&base);
-                }
-                (Box::new(p), ptv::EVERY)
-            }
-            (Feed::Ptv, None) => (
-                Box::new(NoKey::new("PTV NEEDS YOUR KEY: SEE SETTINGS")),
-                Duration::from_secs(60),
-            ),
-        };
         let attribution = provider.attribution().to_string();
         // A live board starts from what it last knew.
         let cached = match setup.feed {
@@ -164,6 +144,7 @@ impl View {
             movements: cached.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
             notices: cached.as_ref().map(|c| c.2.clone()).unwrap_or_default(),
             updated: cached.as_ref().map(|c| c.0),
+            next: None,
             failures: 0,
             error: None,
             page: 0,
@@ -212,6 +193,7 @@ impl View {
                     }
                     self.movements = ms;
                     self.updated = Some(u.at);
+                    self.next = chrono::Duration::from_std(u.wait).ok().map(|w| u.at + w);
                     self.failures = 0;
                     self.error = None;
                 }
@@ -233,7 +215,7 @@ impl View {
 
     /// Sets the cards for `now` on the board's clock, `time` on the
     /// window's.
-    pub fn show(&mut self, time: f64, now: DateTime<Utc>) {
+    pub fn show(&mut self, time: f64, now: DateTime<Utc>, ops: Option<&mut Operators>) {
         let local = now.with_timezone(&self.tz);
         self.title
             .set_rows(&[Row::new(&[self.setup.direction.title()])], time);
@@ -266,7 +248,7 @@ impl View {
         let page = &pages[self.page];
         let cycle = (time / CODESHARE_EVERY) as usize;
         let stale = self.stale(now);
-        let mut rows = normalise::rows(page, &self.setup.specs, cycle, stale);
+        let mut rows = normalise::rows(page, &self.setup.specs, cycle, stale, ops);
         // A changed gate or platform blinks its lamp.
         let stand = self
             .setup
@@ -341,6 +323,12 @@ impl View {
                 }
             } else {
                 parts.push(format!("UPDATED {t}"));
+                if let (Some(next), true) = (self.next, self.setup.feed != Feed::Demo) {
+                    parts.push(format!(
+                        "NEXT {}",
+                        next.with_timezone(&self.tz).format("%H:%M")
+                    ));
+                }
             }
         } else if let Some(e) = &self.error {
             parts.push(e.to_uppercase());

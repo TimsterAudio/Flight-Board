@@ -1873,6 +1873,7 @@ dependencies = [
  "egui",
  "hmac",
  "iana-time-zone",
+ "image",
  "keyring",
  "ron",
  "serde",
