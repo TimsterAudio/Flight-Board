@@ -398,8 +398,7 @@ mod tests {
             mode,
             direction,
             now,
-            terminal: String::new(),
-            want: 15,
+            wants: vec![(String::new(), 15)],
         }
     }
 

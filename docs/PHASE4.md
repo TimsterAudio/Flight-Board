@@ -80,3 +80,15 @@ it up; a release build ignores them.
 - **Any airport's own time**: FlightAware gives each airport's time zone with
   its flights. The board uses it, and keeps it, so an airport given only by
   its ICAO code shows its own local time and its name, not the computer's.
+
+## Paying less: one download for boards that share it
+
+- **Each update fills the board for a while.** A board asks for enough
+  flights to fill every page it turns through, and one page more. Between
+  updates it carries on by itself: flights that have left drop off and the
+  rest move up, so updates can be far apart without the board running dry.
+- **Boards of the same airport and direction share one download** (say T1
+  and T2 departures). It asks a page at a time until every board has
+  enough of its own terminal's flights, then gives the answer to them all.
+  The budget counts downloads, not boards, so two terminal boards update as
+  often as one.

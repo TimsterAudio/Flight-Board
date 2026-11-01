@@ -19,8 +19,9 @@ use crate::clock::Clock;
 use crate::demo::{self, Demo};
 use crate::http::Net;
 use crate::logos::Logos;
-use crate::model::{Direction, Feed, Mode, Place};
+use crate::model::{BoardQuery, Direction, Feed, Mode, Place};
 use crate::normalise::{self, Operators, Spec};
+use crate::poller::{Poller, Share};
 use crate::provider::{NoKey, Provider};
 use crate::ptv::Ptv;
 use crate::view::{Setup, View};
@@ -159,14 +160,18 @@ impl Saved {
     }
 
     /// How many AeroAPI boards share the budget.
+    /// How many AeroAPI downloads share the budget: one for each airport
+    /// and direction, however many boards show it.
     pub fn aero_boards(&self) -> u32 {
-        if self.feed() != Feed::AeroApi {
-            return 0;
-        }
-        match self.layout {
-            Layout::One => 1,
-            _ => 2,
-        }
+        let mut polls: Vec<(String, Direction)> = self
+            .setups()
+            .into_iter()
+            .filter(|s| s.feed == Feed::AeroApi)
+            .map(|s| (s.place.id, s.direction))
+            .collect();
+        polls.sort_by(|a, b| a.0.cmp(&b.0).then((a.1 as u8).cmp(&(b.1 as u8))));
+        polls.dedup();
+        polls.len() as u32
     }
 
     /// Where this board's movements come from.
@@ -208,7 +213,8 @@ impl Saved {
                 direction,
                 feed,
                 place: place.clone(),
-                rows: self.rows.clamp(4, 30),
+                // The same range as Settings offers, so opening it changes nothing.
+                rows: self.rows.clamp(8, 24),
                 page_secs: self.page_secs.max(5) as f64,
                 max_pages: self.max_pages.clamp(1, 10),
                 specs: self.specs(self.mode, direction),
@@ -299,12 +305,13 @@ struct Live {
     aero_boards: u32,
 }
 
-/// A board for `setup`: the demo on the demo's `clock`, a live feed on the
-/// real time with its keys; with no key, a board that says so.
-fn make_view(setup: Setup, clock: Clock, ctx: &egui::Context, time: f64, live: &Live) -> View {
+/// The provider for a board of `setup`'s kind, how often to ask it, and on
+/// what clock: the demo on the demo's `clock`, a live feed on the real time
+/// with its keys; with no key, one that says so.
+fn provider(setup: &Setup, clock: Clock, live: &Live) -> (Box<dyn Provider>, Duration, Clock) {
     let real = Clock::starting(Utc::now(), 1.0);
     let tz: chrono_tz::Tz = setup.place.tz.parse().unwrap_or(chrono_tz::Tz::UTC);
-    let (provider, every, clock): (Box<dyn Provider>, Duration, Clock) = match setup.feed {
+    match setup.feed {
         Feed::Demo => (
             Box::new(Demo::new(tz)),
             // Once a board minute, and at least every few seconds.
@@ -348,8 +355,78 @@ fn make_view(setup: Setup, clock: Clock, ctx: &egui::Context, time: f64, live: &
                 real,
             ),
         },
-    };
-    View::new(setup, clock, ctx, time, provider, every)
+    }
+}
+
+/// What a poll is for: boards of the same feed, place and direction share
+/// one, so they're paid for once.
+fn poll_key(s: &Setup) -> (Feed, String, Direction) {
+    (s.feed, s.place.id.clone(), s.direction)
+}
+
+/// The boards for `setups`, in order, with one poller for each group that
+/// can share one. Each board asks for enough to fill every page it turns
+/// through and one more, so it stays full between updates as flights leave.
+fn make_views(
+    setups: Vec<Setup>,
+    clock: Clock,
+    ctx: &egui::Context,
+    time: f64,
+    live: &Live,
+) -> Vec<View> {
+    let mut views: Vec<Option<View>> = setups.iter().map(|_| None).collect();
+    let mut done = vec![false; setups.len()];
+    for i in 0..setups.len() {
+        if done[i] {
+            continue;
+        }
+        let group: Vec<usize> = (i..setups.len())
+            .filter(|&j| !done[j] && poll_key(&setups[j]) == poll_key(&setups[i]))
+            .collect();
+        let (provider, every, clock) = provider(&setups[i], clock, live);
+        let attribution = provider.attribution().to_string();
+        let query = BoardQuery {
+            place: setups[i].place.clone(),
+            mode: setups[i].mode,
+            direction: setups[i].direction,
+            now: clock.now(),
+            wants: Vec::new(),
+        };
+        let mut shares = Vec::new();
+        let mut ends = Vec::new();
+        for &j in &group {
+            let s = &setups[j];
+            let terminal = Arc::new(Mutex::new(s.terminal.clone()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let share = Share {
+                terminal: terminal.clone(),
+                want: s.rows * (s.max_pages + 1),
+            };
+            shares.push((share, tx));
+            ends.push((j, rx, terminal));
+        }
+        let wake = ctx.clone();
+        let poller = Arc::new(Poller::start(
+            provider,
+            query,
+            shares,
+            clock,
+            every,
+            move || wake.request_repaint(),
+        ));
+        for (j, rx, terminal) in ends {
+            done[j] = true;
+            views[j] = Some(View::new(
+                setups[j].clone(),
+                time,
+                attribution.clone(),
+                poller.clone(),
+                rx,
+                terminal,
+            ));
+        }
+    }
+    views.into_iter().flatten().collect()
 }
 
 /// Today at `h`:`m` on the demo's clock, in UTC.
@@ -429,11 +506,7 @@ impl App {
         let start = o.start.map_or_else(Utc::now, |(h, m)| today_at(h, m));
         let clock = Clock::starting(start, saved.demo_speed);
         let time = cc.egui_ctx.input(|i| i.time);
-        let views = saved
-            .setups()
-            .into_iter()
-            .map(|s| make_view(s, clock, &cc.egui_ctx, time, &live))
-            .collect();
+        let views = make_views(saved.setups(), clock, &cc.egui_ctx, time, &live);
         Self {
             budget_applied: saved.budget.clone(),
             saved,
@@ -487,10 +560,7 @@ impl App {
             self.keys_applied = self.keys_changed;
             self.budget_applied = self.saved.budget.clone();
             let live = self.live();
-            self.views = setups
-                .into_iter()
-                .map(|s| make_view(s, self.clock, ctx, time, &live))
-                .collect();
+            self.views = make_views(setups, self.clock, ctx, time, &live);
         }
     }
 

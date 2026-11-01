@@ -2,8 +2,8 @@
 //! the grid of movements a page at a time, a ticker of cards, and a footer.
 //! It takes movements from its poller and works out what the cards say.
 
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use chrono::{DateTime, Duration as Span, Utc};
 use chrono_tz::Tz;
@@ -14,11 +14,9 @@ use splitflap::rng::Rng;
 use splitflap::{Board, Column, Row, Style};
 
 use crate::cache;
-use crate::clock::Clock;
-use crate::model::{BoardQuery, Direction, Feed, Mode, Movement, Place, Status};
+use crate::model::{Direction, Feed, Mode, Movement, Place, Status};
 use crate::normalise::{self, Field, Operators, Spec};
-use crate::poller::Poller;
-use crate::provider::Provider;
+use crate::poller::{Poller, Update};
 
 /// The title's and the time's big cards.
 const BIG: Vec2 = vec2(44.0, 64.0);
@@ -82,7 +80,9 @@ pub struct View {
     second: Option<Board>,
     grid: Board,
     ticker: Board,
-    poller: Poller,
+    /// The poller, kept while the board is, and its answers.
+    _poller: Arc<Poller>,
+    updates: Receiver<Update>,
     attribution: String,
     movements: Vec<Movement>,
     /// The provider's notices, such as disruptions, for the ticker.
@@ -109,36 +109,23 @@ fn cards_across(width: f32) -> usize {
 }
 
 impl View {
-    /// A board for `setup`, on `clock`, its movements from `provider`
-    /// every `every`.
+    /// A board for `setup`, its movements coming from `poller` by
+    /// `updates`, which may be shared with other boards; `terminal` is the
+    /// board's share of what the poller asks for.
     pub fn new(
         setup: Setup,
-        clock: Clock,
-        ctx: &Context,
         time: f64,
-        provider: Box<dyn Provider>,
-        every: Duration,
+        attribution: String,
+        poller: Arc<Poller>,
+        updates: Receiver<Update>,
+        terminal: Arc<Mutex<String>>,
     ) -> Self {
         let tz: Tz = setup.place.tz.parse().unwrap_or(Tz::UTC);
-        let attribution = provider.attribution().to_string();
         // A live board starts from what it last knew.
         let cached = match setup.feed {
             Feed::Demo => None,
             feed => cache::load(feed.key(), &setup.place, setup.direction),
         };
-        let query = BoardQuery {
-            place: setup.place.clone(),
-            mode: setup.mode,
-            direction: setup.direction,
-            now: clock.now(),
-            terminal: setup.terminal.clone(),
-            want: setup.rows,
-        };
-        let terminal = Arc::new(Mutex::new(setup.terminal.clone()));
-        let wake = ctx.clone();
-        let poller = Poller::start(provider, query, terminal.clone(), clock, every, move || {
-            wake.request_repaint()
-        });
         let columns: Vec<Column> = setup.specs.iter().map(|s| s.column(setup.mode)).collect();
         let grid = Board::new(columns, setup.rows.max(1), time, Rng::seeded()).with_tabs(true);
         let ticker_cards = cards_across(grid.size().x);
@@ -155,7 +142,8 @@ impl View {
             second,
             grid,
             ticker: Board::new(vec![Column::text("", ticker_cards)], 1, time, Rng::seeded()),
-            poller,
+            _poller: poller,
+            updates,
             attribution,
             movements: cached.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
             notices: cached.as_ref().map(|c| c.2.clone()).unwrap_or_default(),
@@ -176,7 +164,7 @@ impl View {
     /// Takes in what the poller has brought, and says what to announce.
     pub fn take_updates(&mut self, time: f64) -> Vec<Announce> {
         let mut out = Vec::new();
-        while let Ok(u) = self.poller.updates.try_recv() {
+        while let Ok(u) = self.updates.try_recv() {
             match u.result {
                 Ok(answer) => {
                     if self.setup.feed != Feed::Demo {

@@ -4,6 +4,8 @@
 //! busy.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+#[cfg(test)]
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -16,6 +18,7 @@ use crate::model::BoardQuery;
 use crate::provider::{Answer, Error, Provider};
 
 /// What a poll brought back, and the board's time it was asked at.
+#[derive(Clone)]
 pub struct Update {
     pub at: DateTime<Utc>,
     /// How long until the next poll.
@@ -23,8 +26,14 @@ pub struct Update {
     pub result: Result<Answer, Error>,
 }
 
+/// A board's share of a poll: its terminal, read afresh for each poll as it
+/// can be changed without starting again, and how many movements fill it.
+pub struct Share {
+    pub terminal: Arc<Mutex<String>>,
+    pub want: usize,
+}
+
 pub struct Poller {
-    pub updates: Receiver<Update>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -38,19 +47,18 @@ pub fn back_off(every: Duration, failures: u32) -> Duration {
 
 impl Poller {
     /// Starts polling `provider` for `query` every `every` (or the
-    /// provider's minimum, if longer), at `clock`'s time, calling `wake`
-    /// after each answer.
-    /// `terminal` is the board's, read afresh for each poll, as it can be
-    /// changed without starting again.
+    /// provider's minimum, if longer), at `clock`'s time, for the boards
+    /// that share it: each answer goes to all of them, and asks for enough
+    /// to fill every one. Calls `wake` after each answer. Stops when it's
+    /// dropped, or when no board is listening.
     pub fn start(
         provider: Box<dyn Provider>,
         query: BoardQuery,
-        terminal: Arc<Mutex<String>>,
+        shares: Vec<(Share, Sender<Update>)>,
         clock: Clock,
         every: Duration,
         wake: impl Fn() + Send + 'static,
     ) -> Self {
-        let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let every = every.max(provider.min_interval());
@@ -62,7 +70,15 @@ impl Poller {
                     let at = clock.now();
                     let q = BoardQuery {
                         now: at,
-                        terminal: terminal.lock().map(|t| t.clone()).unwrap_or_default(),
+                        wants: shares
+                            .iter()
+                            .map(|(s, _)| {
+                                (
+                                    s.terminal.lock().map(|t| t.clone()).unwrap_or_default(),
+                                    s.want,
+                                )
+                            })
+                            .collect(),
                         ..query.clone()
                     };
                     let result = provider.board(&q);
@@ -80,7 +96,12 @@ impl Poller {
                             back_off(every, failures)
                         }
                     };
-                    if tx.send(Update { at, wait, result }).is_err() {
+                    let update = Update { at, wait, result };
+                    let heard = shares
+                        .iter()
+                        .filter(|(_, tx)| tx.send(update.clone()).is_ok())
+                        .count();
+                    if heard == 0 {
                         return;
                     }
                     wake();
@@ -91,12 +112,27 @@ impl Poller {
                 }
             })
             .ok();
-        Self {
-            updates: rx,
-            stop,
-            thread,
-        }
+        Self { stop, thread }
     }
+}
+
+/// A poller for one board alone, and where its answers come.
+#[cfg(test)]
+pub fn single(
+    provider: Box<dyn Provider>,
+    query: BoardQuery,
+    clock: Clock,
+    every: Duration,
+) -> (Poller, Receiver<Update>) {
+    let (tx, rx) = mpsc::channel();
+    let share = Share {
+        terminal: Arc::default(),
+        want: 15,
+    };
+    (
+        Poller::start(provider, query, vec![(share, tx)], clock, every, || {}),
+        rx,
+    )
 }
 
 impl Drop for Poller {
@@ -131,19 +167,71 @@ mod tests {
             mode: Mode::Flight,
             direction: Direction::Departure,
             now: Utc::now(),
-            terminal: String::new(),
-            want: 15,
+            wants: Vec::new(),
         };
-        let p = Poller::start(
+        let (p, rx) = single(
             Box::new(Demo::new(tz)),
             q,
-            Arc::default(),
             Clock::real(),
             Duration::from_secs(5),
+        );
+        let u = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!u.result.unwrap().movements.is_empty());
+        drop(p);
+    }
+
+    #[test]
+    fn boards_that_share_a_poll_all_hear_it_and_ask_together() {
+        use crate::provider::{Answer, Result};
+        use std::sync::mpsc;
+        /// Answers with what it was asked for, as a notice.
+        struct Echo;
+        impl Provider for Echo {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn attribution(&self) -> &str {
+                ""
+            }
+            fn min_interval(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn search(&self, _: &str) -> Result<Vec<crate::model::Place>> {
+                Ok(Vec::new())
+            }
+            fn board(&self, q: &BoardQuery) -> Result<Answer> {
+                Ok(Answer {
+                    notices: q.wants.iter().map(|(t, n)| format!("{t}:{n}")).collect(),
+                    ..Answer::default()
+                })
+            }
+        }
+        let q = BoardQuery {
+            place: Demo::places("UTC")[0].clone(),
+            mode: Mode::Flight,
+            direction: Direction::Departure,
+            now: Utc::now(),
+            wants: Vec::new(),
+        };
+        let (a, ra) = mpsc::channel();
+        let (b, rb) = mpsc::channel();
+        let share = |t: &str, want| Share {
+            terminal: Arc::new(Mutex::new(t.to_string())),
+            want,
+        };
+        let p = Poller::start(
+            Box::new(Echo),
+            q,
+            vec![(share("1", 30), a), (share("2", 45), b)],
+            Clock::real(),
+            Duration::from_secs(60),
             || {},
         );
-        let u = p.updates.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(!u.result.unwrap().movements.is_empty());
+        let got_a = ra.recv_timeout(Duration::from_secs(5)).unwrap();
+        let got_b = rb.recv_timeout(Duration::from_secs(5)).unwrap();
+        let asked = vec!["1:30".to_string(), "2:45".to_string()];
+        assert_eq!(got_a.result.unwrap().notices, asked);
+        assert_eq!(got_b.result.unwrap().notices, asked);
         drop(p);
     }
 }

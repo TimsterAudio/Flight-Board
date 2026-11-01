@@ -580,8 +580,7 @@ impl App {
                             mode: Mode::Flight,
                             direction: Direction::Departure,
                             now: chrono::Utc::now(),
-                            terminal: String::new(),
-                            want: 15,
+                            wants: vec![(String::new(), 15)],
                         };
                         match p.board(&q) {
                             Ok(a) => Ok(format!(

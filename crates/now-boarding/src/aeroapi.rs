@@ -346,7 +346,13 @@ impl Provider for AeroApi {
             fmt(q.now - Span::minutes(10)),
             fmt(q.now + Span::hours(12)),
         );
-        let want_terminal = crate::normalise::terminal_key(&q.terminal);
+        // Each board's terminal, as a key, and how many of its flights fill
+        // it: all of them have to be full.
+        let wants: Vec<(String, usize)> = q
+            .wants
+            .iter()
+            .map(|(t, n)| (crate::normalise::terminal_key(t), (*n).max(1)))
+            .collect();
         let mut list: Vec<Flight> = Vec::new();
         let mut pages = 0;
         loop {
@@ -376,20 +382,23 @@ impl Provider for AeroApi {
                     list.push(x);
                 }
             }
-            let enough = if want_terminal.is_empty() {
-                list.len()
-            } else {
-                list.iter()
-                    .filter(|x| {
-                        let t = match q.direction {
-                            Direction::Departure => &x.terminal_origin,
-                            Direction::Arrival => &x.terminal_destination,
-                        };
-                        t.as_deref().map(crate::normalise::terminal_key)
-                            == Some(want_terminal.clone())
-                    })
-                    .count()
-            } >= q.want.max(1);
+            let terminal_of = |x: &Flight| {
+                let t = match q.direction {
+                    Direction::Departure => &x.terminal_origin,
+                    Direction::Arrival => &x.terminal_destination,
+                };
+                t.as_deref().map(crate::normalise::terminal_key)
+            };
+            let enough = wants.iter().all(|(t, n)| {
+                let have = if t.is_empty() {
+                    list.len()
+                } else {
+                    list.iter()
+                        .filter(|x| terminal_of(x).as_deref() == Some(t.as_str()))
+                        .count()
+                };
+                have >= *n
+            });
             match next {
                 Some(n) if !enough && pages < cap && spent_now(self) < allowed => {
                     url = self.join(&n);
@@ -451,8 +460,7 @@ mod tests {
             mode: Mode::Flight,
             direction,
             now: now(),
-            terminal: String::new(),
-            want: 15,
+            wants: vec![(String::new(), 15)],
         }
     }
 
@@ -580,8 +588,7 @@ mod tests {
         );
         let mut q = query(Direction::Departure);
         q.place.id = "EGLL".into();
-        q.terminal = terminal.into();
-        q.want = want;
+        q.wants = vec![(terminal.into(), want)];
         let a = p.board(&q).unwrap();
         let asked = fake.asked.lock().unwrap().len();
         let paid = spent.lock().unwrap().this_month(now());
@@ -598,6 +605,43 @@ mod tests {
         assert_eq!(paged(9, "5", 15), (4, 4, 12));
         // A board of all terminals is full from the first page here.
         assert_eq!(paged(5, "", 3), (1, 1, 3));
+    }
+
+    #[test]
+    fn boards_sharing_a_download_are_all_filled() {
+        // T5 and T3 boards, one flight of each a page: two of each want two
+        // pages, and one download pays for both.
+        let fake = Arc::new(
+            Fake::default()
+                .with(
+                    "/aeroapi/airports/EGLL/flights/scheduled_departures?cursor=2",
+                    &page(2, Some(3)),
+                )
+                .with(
+                    "/aeroapi/airports/EGLL/flights/scheduled_departures?cursor=3",
+                    &page(3, None),
+                )
+                .with(
+                    "/aeroapi/airports/EGLL/flights/scheduled_departures",
+                    &page(1, Some(2)),
+                ),
+        );
+        let spent = Arc::new(Mutex::new(Spent::default()));
+        let p = AeroApi::new(
+            "secret".into(),
+            Budget {
+                pages: 5,
+                ..Budget::default()
+            },
+            spent.clone(),
+            Box::new(fake.clone()),
+        );
+        let mut q = query(Direction::Departure);
+        q.place.id = "EGLL".into();
+        q.wants = vec![("T5".into(), 2), ("3".into(), 2)];
+        p.board(&q).unwrap();
+        assert_eq!(fake.asked.lock().unwrap().len(), 2);
+        assert_eq!(spent.lock().unwrap().this_month(now()), 2);
     }
 
     #[test]

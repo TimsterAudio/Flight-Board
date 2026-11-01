@@ -150,8 +150,8 @@ pub struct BoardQuery {
     pub direction: Direction,
     /// The time now: the real time, or the demo's when it runs fast.
     pub now: DateTime<Utc>,
-    /// The terminal the board shows, empty for all, and how many movements
-    /// fill it: a provider that pays by the page asks only for enough.
-    pub terminal: String,
-    pub want: usize,
+    /// For each board the answer goes to: its terminal, empty for all, and
+    /// how many movements fill it. A provider that pays by the page asks for
+    /// just enough to fill them all.
+    pub wants: Vec<(String, usize)>,
 }
