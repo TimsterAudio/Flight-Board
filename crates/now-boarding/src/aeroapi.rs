@@ -148,7 +148,14 @@ struct Flight {
 struct Flights {
     scheduled_departures: Vec<Flight>,
     scheduled_arrivals: Vec<Flight>,
-    num_pages: Option<u32>,
+    links: Option<Links>,
+}
+
+/// Where the next page is, if there's one.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Links {
+    next: Option<String>,
 }
 
 /// `QF401` as a board writes it: `QF 401`.
@@ -253,6 +260,24 @@ impl AeroApi {
         }
     }
 
+    /// The URL of a next-page link: given from the API's root, or whole.
+    fn join(&self, next: &str) -> String {
+        if next.starts_with("http") {
+            return next.to_string();
+        }
+        // The base is the API's root: the site, then its path.
+        let site_end = self.base.find("://").map_or(0, |i| i + 3);
+        let site = self.base[site_end..]
+            .find('/')
+            .map_or(self.base.as_str(), |i| &self.base[..site_end + i]);
+        let root = &self.base[site.len()..];
+        if !root.is_empty() && next.starts_with(root) {
+            format!("{site}{next}")
+        } else {
+            format!("{}{next}", self.base)
+        }
+    }
+
     /// Asks somewhere else than FlightAware, such as a stand-in server.
     // Only debug builds' stand-in servers use this.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -288,44 +313,90 @@ impl Provider for AeroApi {
         Ok(crate::airports::search(text, "UTC"))
     }
 
+    /// The airport's next flights, a page at a time: for a board of one
+    /// terminal, until there are enough of that terminal's to fill it, as
+    /// many pages as the budget allows each update, or FlightAware has no
+    /// more. Each page is counted as it's paid for.
     fn board(&self, q: &BoardQuery) -> Result<Answer> {
-        let pages = self.budget.pages.max(1);
-        {
-            let spent = self
-                .spent
+        let cap = self.budget.pages.max(1);
+        let allowed = self.budget.pages_a_month();
+        let spent_now = |s: &Self| {
+            s.spent
                 .lock()
-                .map_err(|_| Error::Failed("budget lost".into()))?;
-            if spent.this_month(q.now) + pages > self.budget.pages_a_month() {
-                return Err(Error::Failed(format!(
-                    "THIS MONTH'S AEROAPI BUDGET IS USED: BACK ON {}",
-                    next_month(q.now)
-                )));
-            }
+                .map(|x| x.this_month(q.now))
+                .unwrap_or(u32::MAX)
+        };
+        if spent_now(self) >= allowed {
+            return Err(Error::Failed(format!(
+                "THIS MONTH'S AEROAPI BUDGET IS USED: BACK ON {}",
+                next_month(q.now)
+            )));
         }
         let kind = match q.direction {
             Direction::Departure => "scheduled_departures",
             Direction::Arrival => "scheduled_arrivals",
         };
         let fmt = |t: DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let url = format!(
-            "{}/airports/{}/flights/{kind}?type=Airline&max_pages={pages}&start={}&end={}",
+        // From a few minutes ago, so the page isn't spent on flights long
+        // gone.
+        let mut url = format!(
+            "{}/airports/{}/flights/{kind}?type=Airline&max_pages=1&start={}&end={}",
             self.base,
             q.place.id,
-            fmt(q.now - Span::minutes(30)),
+            fmt(q.now - Span::minutes(10)),
             fmt(q.now + Span::hours(12)),
         );
-        let answer = self.fetch.get(&url, &[("x-apikey", &self.key)]);
-        // A request that was answered is paid for, whatever it said.
-        let body = answer?;
-        let f: Flights = serde_json::from_str(&body)
-            .map_err(|e| Error::Failed(format!("AeroAPI's answer didn't read: {e}")))?;
-        if let Ok(mut spent) = self.spent.lock() {
-            spent.add(q.now, f.num_pages.unwrap_or(1).clamp(1, pages));
+        let want_terminal = crate::normalise::terminal_key(&q.terminal);
+        let mut list: Vec<Flight> = Vec::new();
+        let mut pages = 0;
+        loop {
+            let body = match self.fetch.get(&url, &[("x-apikey", &self.key)]) {
+                Ok(b) => b,
+                // A later page failing still leaves the ones got.
+                Err(_) if pages > 0 => break,
+                Err(e) => return Err(e),
+            };
+            let f: Flights = serde_json::from_str(&body)
+                .map_err(|e| Error::Failed(format!("AeroAPI's answer didn't read: {e}")))?;
+            // An answered request is paid for, whatever it said.
+            if let Ok(mut spent) = self.spent.lock() {
+                spent.add(q.now, 1);
+            }
+            pages += 1;
+            let next = f.links.and_then(|l| l.next);
+            let got = match q.direction {
+                Direction::Departure => f.scheduled_departures,
+                Direction::Arrival => f.scheduled_arrivals,
+            };
+            for x in got {
+                if !list
+                    .iter()
+                    .any(|y| y.fa_flight_id == x.fa_flight_id && !x.fa_flight_id.is_empty())
+                {
+                    list.push(x);
+                }
+            }
+            let enough = if want_terminal.is_empty() {
+                list.len()
+            } else {
+                list.iter()
+                    .filter(|x| {
+                        let t = match q.direction {
+                            Direction::Departure => &x.terminal_origin,
+                            Direction::Arrival => &x.terminal_destination,
+                        };
+                        t.as_deref().map(crate::normalise::terminal_key)
+                            == Some(want_terminal.clone())
+                    })
+                    .count()
+            } >= q.want.max(1);
+            match next {
+                Some(n) if !enough && pages < cap && spent_now(self) < allowed => {
+                    url = self.join(&n);
+                }
+                _ => break,
+            }
         }
-        let list = match q.direction {
-            Direction::Departure => &f.scheduled_departures,
-            Direction::Arrival => &f.scheduled_arrivals,
-        };
         // The airport itself, as the flights describe it: its time zone,
         // so an airport the app only knew by its code shows its own time.
         let here = list.iter().find_map(|x| match q.direction {
@@ -380,6 +451,8 @@ mod tests {
             mode: Mode::Flight,
             direction,
             now: now(),
+            terminal: String::new(),
+            want: 15,
         }
     }
 
@@ -411,7 +484,7 @@ mod tests {
         // airlines only, one page.
         let url = &fake.asked.lock().unwrap()[0];
         assert!(!url.contains("secret"));
-        assert!(url.contains("type=Airline&max_pages=1&start=2026-10-30T06:30:00Z"));
+        assert!(url.contains("type=Airline&max_pages=1&start=2026-10-30T06:50:00Z"));
     }
 
     #[test]
@@ -449,6 +522,82 @@ mod tests {
         assert_eq!(ms[1].status, Status::Expected);
         assert_eq!(ms[2].status, Status::Diverted);
         assert_eq!(ms[0].stand, None);
+    }
+
+    /// A page of three flights, one in terminal 5, pointing to page
+    /// `next` if there is one.
+    fn page(n: u32, next: Option<u32>) -> String {
+        let flight = |k: u32, t: &str| {
+            format!(
+                r#"{{"ident_iata": "BA{n}{k}", "fa_flight_id": "f{n}-{k}", "terminal_origin": "{t}",
+                    "scheduled_out": "2026-10-30T07:{:02}:00Z", "destination": {{"city": "Dublin"}}}}"#,
+                n * 3 + k
+            )
+        };
+        let links = next.map_or("null".to_string(), |p| {
+            format!(
+                r#"{{"next": "/aeroapi/airports/EGLL/flights/scheduled_departures?cursor={p}"}}"#
+            )
+        });
+        format!(
+            r#"{{"links": {links}, "scheduled_departures": [{}, {}, {}]}}"#,
+            flight(1, "5"),
+            flight(2, "3"),
+            flight(3, "2")
+        )
+    }
+
+    /// A stand-in AeroAPI with four pages, and what's been spent.
+    fn paged(pages_each: u32, terminal: &str, want: usize) -> (usize, u32, usize) {
+        let fake = Arc::new(
+            Fake::default()
+                .with(
+                    "/aeroapi/airports/EGLL/flights/scheduled_departures?cursor=2",
+                    &page(2, Some(3)),
+                )
+                .with(
+                    "/aeroapi/airports/EGLL/flights/scheduled_departures?cursor=3",
+                    &page(3, Some(4)),
+                )
+                .with(
+                    "/aeroapi/airports/EGLL/flights/scheduled_departures?cursor=4",
+                    &page(4, None),
+                )
+                .with(
+                    "/aeroapi/airports/EGLL/flights/scheduled_departures",
+                    &page(1, Some(2)),
+                ),
+        );
+        let spent = Arc::new(Mutex::new(Spent::default()));
+        let p = AeroApi::new(
+            "secret".into(),
+            Budget {
+                pages: pages_each,
+                ..Budget::default()
+            },
+            spent.clone(),
+            Box::new(fake.clone()),
+        );
+        let mut q = query(Direction::Departure);
+        q.place.id = "EGLL".into();
+        q.terminal = terminal.into();
+        q.want = want;
+        let a = p.board(&q).unwrap();
+        let asked = fake.asked.lock().unwrap().len();
+        let paid = spent.lock().unwrap().this_month(now());
+        (asked, paid, a.movements.len())
+    }
+
+    #[test]
+    fn a_terminal_board_asks_for_pages_until_it_is_full() {
+        // Two terminal 5 flights wanted, one a page: two pages.
+        assert_eq!(paged(5, "T5", 2), (2, 2, 6));
+        // Never more pages than the budget allows each update.
+        assert_eq!(paged(3, "5", 15), (3, 3, 9));
+        // Nor more than there are.
+        assert_eq!(paged(9, "5", 15), (4, 4, 12));
+        // A board of all terminals is full from the first page here.
+        assert_eq!(paged(5, "", 3), (1, 1, 3));
     }
 
     #[test]

@@ -580,6 +580,8 @@ impl App {
                             mode: Mode::Flight,
                             direction: Direction::Departure,
                             now: chrono::Utc::now(),
+                            terminal: String::new(),
+                            want: 15,
                         };
                         match p.board(&q) {
                             Ok(a) => Ok(format!(
@@ -670,7 +672,7 @@ impl App {
                     .prefix("$"),
             );
             ui.end_row();
-            ui.label("Pages each update (15 flights a page)");
+            ui.label("Pages each update, at most (15 flights a page)");
             ui.add(egui::DragValue::new(&mut b.pages).range(1..=5));
             ui.end_row();
             ui.label("Hours a day the board is open");
@@ -690,7 +692,7 @@ impl App {
             .map(|s| s.this_month(chrono::Utc::now()))
             .unwrap_or(0);
         ui.label(format!(
-            "So the board updates about every {}. This month: {used} of {} pages, about ${:.2} of ${:.2}.",
+            "So the board updates about every {}, even when it uses every page. This month: {used} of {} pages, about ${:.2} of ${:.2}.",
             if every >= 90.0 {
                 format!("{:.1} hours", every / 60.0)
             } else {
@@ -749,8 +751,10 @@ impl App {
         ui.label(
             RichText::new(
                 "Terminals offered are the ones in the flights the board has. Flights with no \
-                 terminal given show only on All. One terminal's board leaves the others' flights \
-                 out, so with live flights 2 or 3 pages each update fill it better.",
+                 terminal given show only on All. FlightAware sends the whole airport's \
+                 flights, a page of 15 at a time, so a one-terminal board asks for pages until \
+                 it's full, up to the pages each update set above: at a busy airport such as \
+                 Heathrow, 4 or 5.",
             )
             .weak(),
         );

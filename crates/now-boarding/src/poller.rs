@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -40,9 +40,12 @@ impl Poller {
     /// Starts polling `provider` for `query` every `every` (or the
     /// provider's minimum, if longer), at `clock`'s time, calling `wake`
     /// after each answer.
+    /// `terminal` is the board's, read afresh for each poll, as it can be
+    /// changed without starting again.
     pub fn start(
         provider: Box<dyn Provider>,
         query: BoardQuery,
+        terminal: Arc<Mutex<String>>,
         clock: Clock,
         every: Duration,
         wake: impl Fn() + Send + 'static,
@@ -59,6 +62,7 @@ impl Poller {
                     let at = clock.now();
                     let q = BoardQuery {
                         now: at,
+                        terminal: terminal.lock().map(|t| t.clone()).unwrap_or_default(),
                         ..query.clone()
                     };
                     let result = provider.board(&q);
@@ -127,10 +131,13 @@ mod tests {
             mode: Mode::Flight,
             direction: Direction::Departure,
             now: Utc::now(),
+            terminal: String::new(),
+            want: 15,
         };
         let p = Poller::start(
             Box::new(Demo::new(tz)),
             q,
+            Arc::default(),
             Clock::real(),
             Duration::from_secs(5),
             || {},

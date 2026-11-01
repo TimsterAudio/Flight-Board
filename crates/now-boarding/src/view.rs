@@ -2,6 +2,7 @@
 //! the grid of movements a page at a time, a ticker of cards, and a footer.
 //! It takes movements from its poller and works out what the cards say.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as Span, Utc};
@@ -72,6 +73,9 @@ pub struct View {
     /// place the app only knew by its code.
     learned_tz: Option<String>,
     learned_name: Option<String>,
+    /// The terminal, shared with the poller, which asks for enough of its
+    /// flights.
+    terminal: Arc<Mutex<String>>,
     title: Board,
     clock: Board,
     name: Board,
@@ -127,9 +131,12 @@ impl View {
             mode: setup.mode,
             direction: setup.direction,
             now: clock.now(),
+            terminal: setup.terminal.clone(),
+            want: setup.rows,
         };
+        let terminal = Arc::new(Mutex::new(setup.terminal.clone()));
         let wake = ctx.clone();
-        let poller = Poller::start(provider, query, clock, every, move || {
+        let poller = Poller::start(provider, query, terminal.clone(), clock, every, move || {
             wake.request_repaint()
         });
         let columns: Vec<Column> = setup.specs.iter().map(|s| s.column(setup.mode)).collect();
@@ -141,6 +148,7 @@ impl View {
             tz,
             learned_tz: None,
             learned_name: None,
+            terminal,
             title: Board::new(vec![Column::text("", 10)], 1, time, Rng::seeded()).with_card(BIG),
             clock: Board::new(vec![Column::time("", 5)], 1, time, Rng::seeded()).with_card(BIG),
             name: Board::new(vec![Column::text("", 24)], 1, time, Rng::seeded()),
@@ -317,6 +325,15 @@ impl View {
         match self.setup.terminal.trim() {
             "" => name,
             t => format!("{name}  TERMINAL {}", normalise::terminal_key(t)),
+        }
+    }
+
+    /// Shows terminal `t` from now on, empty for all, without starting
+    /// again: the poller asks for it from its next update.
+    pub fn set_terminal(&mut self, t: &str) {
+        self.setup.terminal = t.to_string();
+        if let Ok(mut shared) = self.terminal.lock() {
+            *shared = t.to_string();
         }
     }
 

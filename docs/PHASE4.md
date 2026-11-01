@@ -23,7 +23,7 @@ AeroAPI bills by the page of results (15 flights). The budget is:
 
 - how much a month you'll spend (default $5, the Personal tier's credit),
 - what a page costs,
-- pages each update (default 1),
+- pages each update, at most (default 1),
 - the hours a day the board is open (default 8).
 
 From those, the app works out how often to ask. One board at $5, 2 cents a
@@ -68,9 +68,11 @@ it up; a release build ignores them.
 - **Terminals**: each board can show all terminals or one (Settings,
   Terminals). The terminals offered are those named in the flights the board
   has. A flight with no terminal given shows only on All. FlightAware sends
-  the whole airport whatever the board shows, so a one-terminal board throws
-  the rest away: 2 or 3 pages each update fill it better, and the budget
-  spaces the updates out to match. Changing a board's terminal takes effect
+  the whole airport, 15 flights a page, so a one-terminal board asks a page
+  at a time until it has enough of its terminal's flights to fill it, up to
+  the pages each update set in the budget (at a busy airport such as
+  Heathrow, 4 or 5), or until there are no more. The budget spaces the
+  updates out as if every page were used. Changing a board's terminal takes effect
   at once, without asking FlightAware again.
 - **Two boards of the same kind**: with two boards (stacked, or a window
   each), the second can be arrivals or a second departures board: T1

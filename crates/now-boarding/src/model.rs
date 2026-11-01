@@ -150,4 +150,8 @@ pub struct BoardQuery {
     pub direction: Direction,
     /// The time now: the real time, or the demo's when it runs fast.
     pub now: DateTime<Utc>,
+    /// The terminal the board shows, empty for all, and how many movements
+    /// fill it: a provider that pays by the page asks only for enough.
+    pub terminal: String,
+    pub want: usize,
 }

@@ -475,7 +475,7 @@ impl App {
                 let mut was = v.setup.clone();
                 was.terminal = s.terminal.clone();
                 if was == *s {
-                    v.setup.terminal = s.terminal.clone();
+                    v.set_terminal(&s.terminal);
                 }
             }
         }

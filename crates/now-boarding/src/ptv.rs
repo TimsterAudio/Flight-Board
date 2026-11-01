@@ -463,6 +463,8 @@ mod tests {
             mode: Mode::Train,
             direction: Direction::Departure,
             now,
+            terminal: String::new(),
+            want: 15,
         }
     }
 

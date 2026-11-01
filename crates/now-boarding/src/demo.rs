@@ -398,6 +398,8 @@ mod tests {
             mode,
             direction,
             now,
+            terminal: String::new(),
+            want: 15,
         }
     }
 
