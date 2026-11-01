@@ -116,6 +116,7 @@ struct Airport {
     code_iata: Option<String>,
     name: Option<String>,
     city: Option<String>,
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -321,17 +322,41 @@ impl Provider for AeroApi {
         if let Ok(mut spent) = self.spent.lock() {
             spent.add(q.now, f.num_pages.unwrap_or(1).clamp(1, pages));
         }
-        let tz: Tz = q.place.tz.parse().unwrap_or(Tz::UTC);
         let list = match q.direction {
             Direction::Departure => &f.scheduled_departures,
             Direction::Arrival => &f.scheduled_arrivals,
         };
+        // The airport itself, as the flights describe it: its time zone,
+        // so an airport the app only knew by its code shows its own time.
+        let here = list.iter().find_map(|x| match q.direction {
+            Direction::Departure => x.origin.as_ref(),
+            Direction::Arrival => x.destination.as_ref(),
+        });
+        let learned_tz = here
+            .and_then(|a| a.timezone.clone())
+            .filter(|t| t.parse::<Tz>().is_ok());
+        let tz: Tz = learned_tz
+            .as_deref()
+            .unwrap_or(&q.place.tz)
+            .parse()
+            .unwrap_or(Tz::UTC);
         Ok(Answer {
             movements: list
                 .iter()
                 .filter_map(|x| movement(x, q.direction, tz, q.now))
                 .collect(),
             notices: Vec::new(),
+            tz: learned_tz,
+            name: here
+                .map(|a| {
+                    named(&Some(Airport {
+                        code_iata: a.code_iata.clone(),
+                        name: a.name.clone(),
+                        city: a.city.clone(),
+                        timezone: None,
+                    }))
+                })
+                .filter(|n| !n.is_empty()),
         })
     }
 }
@@ -387,6 +412,26 @@ mod tests {
         let url = &fake.asked.lock().unwrap()[0];
         assert!(!url.contains("secret"));
         assert!(url.contains("type=Airline&max_pages=1&start=2026-10-30T06:30:00Z"));
+    }
+
+    #[test]
+    fn an_airport_known_only_by_its_code_learns_its_time_zone() {
+        let fake = Arc::new(Fake::default().with("/aeroapi/", DEPARTURES));
+        let mut q = query(Direction::Departure);
+        // Found by its code, in the computer's own zone.
+        q.place = Place {
+            id: "YMML".into(),
+            name: "YMML".into(),
+            tz: "Europe/London".into(),
+        };
+        let a = api(fake, Arc::default()).board(&q).unwrap();
+        assert_eq!(a.tz.as_deref(), Some("Australia/Melbourne"));
+        assert_eq!(a.name.as_deref(), Some("Melbourne"));
+        // Times are in the airport's own zone, not the computer's.
+        assert_eq!(
+            a.movements[0].scheduled.format("%H:%M").to_string(),
+            "18:00"
+        );
     }
 
     #[test]

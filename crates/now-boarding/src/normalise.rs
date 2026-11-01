@@ -238,6 +238,15 @@ pub fn moved(before: &[Movement], after: &[Movement]) -> Vec<String> {
         .collect()
 }
 
+/// A terminal as a short key to compare by: `2` for "T2", "2" or
+/// "Terminal 2".
+pub fn terminal_key(t: &str) -> String {
+    let u = t.trim().to_uppercase();
+    let u = u.strip_prefix("TERMINAL").unwrap_or(&u).trim();
+    let u = u.strip_prefix('T').unwrap_or(u).trim();
+    u.to_string()
+}
+
 /// Splits `rows` into pages of `per` rows. Always at least one page, which
 /// may be empty.
 pub fn pages<T: Clone>(rows: &[T], per: usize) -> Vec<Vec<T>> {
@@ -413,6 +422,14 @@ mod tests {
         let mut none = a.clone();
         none.stand = None;
         assert!(moved(&[none], &[b]).is_empty());
+    }
+
+    #[test]
+    fn terminals_compare_however_they_are_written() {
+        for t in ["2", "T2", "t2", "Terminal 2", " T 2 "] {
+            assert_eq!(terminal_key(t), "2", "{t}");
+        }
+        assert_eq!(terminal_key("International"), "INTERNATIONAL");
     }
 
     #[test]

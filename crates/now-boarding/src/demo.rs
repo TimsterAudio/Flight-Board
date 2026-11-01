@@ -370,7 +370,7 @@ impl Provider for Demo {
         }
         Ok(Answer {
             movements: out,
-            notices: Vec::new(),
+            ..Answer::default()
         })
     }
 }

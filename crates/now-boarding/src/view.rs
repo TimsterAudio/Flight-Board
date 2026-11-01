@@ -52,6 +52,8 @@ pub struct Setup {
     pub max_pages: usize,
     pub specs: Vec<Spec>,
     pub second_title: String,
+    /// Only this terminal's movements, such as `2` or `T2`; empty for all.
+    pub terminal: String,
 }
 
 /// Something the board wants announced with the chime.
@@ -66,6 +68,10 @@ pub enum Announce {
 pub struct View {
     pub setup: Setup,
     tz: Tz,
+    /// The place's time zone and name, as the provider gave them, for a
+    /// place the app only knew by its code.
+    learned_tz: Option<String>,
+    learned_name: Option<String>,
     title: Board,
     clock: Board,
     name: Board,
@@ -133,6 +139,8 @@ impl View {
             .then(|| Board::new(vec![Column::text("", 24)], 1, time, Rng::seeded()));
         Self {
             tz,
+            learned_tz: None,
+            learned_name: None,
             title: Board::new(vec![Column::text("", 10)], 1, time, Rng::seeded()).with_card(BIG),
             clock: Board::new(vec![Column::time("", 5)], 1, time, Rng::seeded()).with_card(BIG),
             name: Board::new(vec![Column::text("", 24)], 1, time, Rng::seeded()),
@@ -174,6 +182,13 @@ impl View {
                         );
                     }
                     self.notices = answer.notices;
+                    if let Some(tz) = answer.tz.as_deref().and_then(|t| t.parse().ok()) {
+                        self.tz = tz;
+                        self.learned_tz = answer.tz.clone();
+                    }
+                    if answer.name.is_some() {
+                        self.learned_name = answer.name.clone();
+                    }
                     let ms = normalise::normalise(answer.movements, u.at);
                     if self.updated.is_some() {
                         for id in normalise::moved(&self.movements, &ms) {
@@ -221,10 +236,8 @@ impl View {
             .set_rows(&[Row::new(&[self.setup.direction.title()])], time);
         self.clock
             .set_rows(&[Row::new(&[local.format("%H:%M").to_string()])], time);
-        self.name.set_rows(
-            &[Row::new(&[self.setup.place.name.as_str()]).ink(WHITE)],
-            time,
-        );
+        self.name
+            .set_rows(&[Row::new(&[self.place_name()]).ink(WHITE)], time);
         if let Some(b) = &mut self.second {
             b.set_rows(
                 &[Row::new(&[self.setup.second_title.as_str()]).ink(WHITE)],
@@ -233,7 +246,17 @@ impl View {
         }
 
         // Movements gone since the last update leave now, not at the next.
-        let ms = normalise::normalise(self.movements.clone(), now);
+        let mut ms = normalise::normalise(self.movements.clone(), now);
+        // One terminal's board leaves out the others' movements, and those
+        // with no terminal given.
+        if !self.setup.terminal.trim().is_empty() {
+            let want = normalise::terminal_key(&self.setup.terminal);
+            ms.retain(|m| {
+                m.terminal
+                    .as_deref()
+                    .is_some_and(|t| normalise::terminal_key(t) == want)
+            });
+        }
         // Only the next few pages, as a real board shows.
         let shown = &ms[..ms.len().min(self.setup.rows * self.setup.max_pages.max(1))];
         let pages = normalise::pages(shown, self.setup.rows);
@@ -280,6 +303,40 @@ impl View {
             .cloned()
             .unwrap_or_default();
         self.ticker.set_rows(&[Row::new(&[piece]).ink(WHITE)], time);
+    }
+
+    /// The place's name as the board shows it: what the provider called a
+    /// place the app only knew by its code, and the terminal, if the board
+    /// is one terminal's.
+    fn place_name(&self) -> String {
+        let p = &self.setup.place;
+        let name = match &self.learned_name {
+            Some(n) if p.name == p.id => n.clone(),
+            _ => p.name.clone(),
+        };
+        match self.setup.terminal.trim() {
+            "" => name,
+            t => format!("{name}  TERMINAL {}", normalise::terminal_key(t)),
+        }
+    }
+
+    /// The time zone and name the provider gave for the place, if it did.
+    pub fn learned(&self) -> (Option<&str>, Option<&str>) {
+        (self.learned_tz.as_deref(), self.learned_name.as_deref())
+    }
+
+    /// The terminals in the movements the board has, for Settings to offer.
+    pub fn terminals(&self) -> Vec<String> {
+        let mut t: Vec<String> = self
+            .movements
+            .iter()
+            .filter_map(|m| m.terminal.as_deref())
+            .map(normalise::terminal_key)
+            .filter(|t| !t.is_empty())
+            .collect();
+        t.sort();
+        t.dedup();
+        t
     }
 
     fn ticker_text(&self, ms: &[Movement]) -> String {

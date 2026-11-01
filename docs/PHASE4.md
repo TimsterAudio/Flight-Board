@@ -62,3 +62,19 @@ website, and a month's polling inside the free allowance.
 The screenshots come from a stand-in server with made-up flights. In a debug
 build only, `NOW_BOARDING_AEROAPI_BASE` and `NOW_BOARDING_AEROAPI_KEY` set
 it up; a release build ignores them.
+
+## Terminals, and any airport's own time
+
+- **Terminals**: each board can show all terminals or one (Settings,
+  Terminals). The terminals offered are those named in the flights the board
+  has. A flight with no terminal given shows only on All. FlightAware sends
+  the whole airport whatever the board shows, so a one-terminal board throws
+  the rest away: 2 or 3 pages each update fill it better, and the budget
+  spaces the updates out to match. Changing a board's terminal takes effect
+  at once, without asking FlightAware again.
+- **Two boards of the same kind**: with two boards (stacked, or a window
+  each), the second can be arrivals or a second departures board: T1
+  departures beside T2 departures, say.
+- **Any airport's own time**: FlightAware gives each airport's time zone with
+  its flights. The board uses it, and keeps it, so an airport given only by
+  its ICAO code shows its own local time and its name, not the computer's.

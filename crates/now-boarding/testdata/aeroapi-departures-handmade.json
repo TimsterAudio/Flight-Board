@@ -6,7 +6,7 @@
     {"ident": "QFA401", "ident_icao": "QFA401", "ident_iata": "QF401", "fa_flight_id": "QFA401-1761700000-schedule-0001",
      "operator": "QFA", "operator_iata": "QF", "flight_number": "401", "codeshares": ["AAL7365", "UAE5101"], "codeshares_iata": ["AA7365", "EK5101"],
      "cancelled": false, "diverted": false,
-     "origin": {"code": "YMML", "code_iata": "MEL", "name": "Melbourne", "city": "Melbourne"},
+     "origin": {"code": "YMML", "code_iata": "MEL", "name": "Melbourne", "city": "Melbourne", "timezone": "Australia/Melbourne"},
      "destination": {"code": "YSSY", "code_iata": "SYD", "name": "Sydney", "city": "Sydney"},
      "scheduled_out": "2026-10-30T07:00:00Z", "estimated_out": "2026-10-30T07:02:00Z", "actual_out": null,
      "scheduled_in": "2026-10-30T08:25:00Z", "estimated_in": "2026-10-30T08:27:00Z", "actual_in": null,

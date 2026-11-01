@@ -94,6 +94,11 @@ pub struct Saved {
     pub airport: Place,
     pub budget: Budget,
     pub spent: Spent,
+    /// The second board, stacked or in its own window: arrivals, or a second
+    /// departures board, say for another terminal.
+    pub second: Direction,
+    /// Each board's terminal, the first board's first; empty for all.
+    pub terminals: Vec<String>,
     /// Airline colour cards, and colours set here, by airline code.
     pub colour_cards: bool,
     pub airline_colours: Vec<(String, [u8; 3])>,
@@ -125,6 +130,8 @@ impl Default for Saved {
             airport: airports::melbourne(),
             budget: Budget::default(),
             spent: Spent::default(),
+            second: Direction::Arrival,
+            terminals: Vec::new(),
             colour_cards: true,
             airline_colours: Vec::new(),
         }
@@ -190,12 +197,13 @@ impl Saved {
             (Feed::Ptv, _) => vec![Direction::Departure],
             (_, Layout::One) => vec![self.direction],
             (_, Layout::Stacked | Layout::TwoWindows) => {
-                vec![Direction::Departure, Direction::Arrival]
+                vec![Direction::Departure, self.second]
             }
         };
         directions
             .into_iter()
-            .map(|direction| Setup {
+            .enumerate()
+            .map(|(i, direction)| Setup {
                 mode: self.mode,
                 direction,
                 feed,
@@ -205,6 +213,11 @@ impl Saved {
                 max_pages: self.max_pages.clamp(1, 10),
                 specs: self.specs(self.mode, direction),
                 second_title: self.second_title.clone(),
+                // Terminals are an airport's: train boards have none.
+                terminal: match self.mode {
+                    Mode::Flight => self.terminals.get(i).cloned().unwrap_or_default(),
+                    Mode::Train => String::new(),
+                },
             })
             .collect()
     }
@@ -455,6 +468,17 @@ impl App {
             self.views.clear();
         }
         let setups = self.saved.setups();
+        // A new terminal only filters what a board has: it takes it in
+        // place, rather than starting again and asking (and paying) anew.
+        if setups.len() == self.views.len() {
+            for (s, v) in setups.iter().zip(&mut self.views) {
+                let mut was = v.setup.clone();
+                was.terminal = s.terminal.clone();
+                if was == *s {
+                    v.setup.terminal = s.terminal.clone();
+                }
+            }
+        }
         let same = setups.len() == self.views.len()
             && setups.iter().zip(&self.views).all(|(s, v)| *s == v.setup)
             && self.keys_applied == self.keys_changed
@@ -467,6 +491,37 @@ impl App {
                 .into_iter()
                 .map(|s| make_view(s, self.clock, ctx, time, &live))
                 .collect();
+        }
+    }
+
+    /// Keeps what AeroAPI has said about the airport: its time zone, and for
+    /// one known only by its code, its name. The boards take them on without
+    /// starting again, which would cost a query.
+    fn learn_airport(&mut self) {
+        let a = &mut self.saved.airport;
+        let mut learned = None;
+        for v in &self.views {
+            if v.setup.feed == Feed::AeroApi && v.setup.place.id == a.id {
+                let (tz, name) = v.learned();
+                if tz.is_some() || name.is_some() {
+                    learned = Some((tz.map(str::to_string), name.map(str::to_string)));
+                }
+            }
+        }
+        let Some((tz, name)) = learned else {
+            return;
+        };
+        if let Some(tz) = tz {
+            a.tz = tz;
+        }
+        if let Some(name) = name.filter(|_| a.name == a.id) {
+            a.name = name;
+        }
+        let place = a.clone();
+        for v in &mut self.views {
+            if v.setup.feed == Feed::AeroApi && v.setup.place.id == place.id {
+                v.setup.place = place.clone();
+            }
         }
     }
 
@@ -668,6 +723,7 @@ impl eframe::App for App {
         for v in &mut self.views {
             announce.extend(v.take_updates(time));
         }
+        self.learn_airport();
         if !announce.is_empty() && self.saved.chime && time >= self.next_chime {
             if let Some(s) = &mut self.sound {
                 s.chime(self.saved.chime_volume);

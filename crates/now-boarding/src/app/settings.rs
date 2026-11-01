@@ -132,13 +132,23 @@ impl App {
         ui.radio_value(
             &mut s.layout,
             Layout::Stacked,
-            "Departures above arrivals, in one window",
+            "Two boards, one above the other, in one window",
         );
         ui.radio_value(
             &mut s.layout,
             Layout::TwoWindows,
-            "Departures and arrivals, in a window each",
+            "Two boards, in a window each",
         );
+        if s.layout != Layout::One {
+            ui.indent("second", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Departures, then");
+                    ui.selectable_value(&mut s.second, Direction::Arrival, "arrivals");
+                    ui.selectable_value(&mut s.second, Direction::Departure, "departures again")
+                        .on_hover_text("Say for another terminal: set each board's below");
+                });
+            });
+        }
         ui.add_space(4.0);
         match s.mode {
             Mode::Flight => {
@@ -166,6 +176,7 @@ impl App {
             Feed::Demo => {}
         }
         if self.saved.mode == Mode::Flight {
+            self.terminals_page(ui);
             self.airline_cards(ui);
         }
         let s = &mut self.saved;
@@ -693,6 +704,53 @@ impl App {
             RichText::new(
                 "Once the month's budget is used, the board stops asking until the 1st. \
                  Check the price per page on AeroAPI's own pricing page.",
+            )
+            .weak(),
+        );
+    }
+
+    /// Each board's terminal: all, or one, from those the flights name.
+    fn terminals_page(&mut self, ui: &mut Ui) {
+        heading(ui, "Terminals");
+        let boards = self.views.len().max(1);
+        let mut seen: Vec<String> = self.views.iter().flat_map(|v| v.terminals()).collect();
+        seen.sort();
+        seen.dedup();
+        let s = &mut self.saved;
+        if s.terminals.len() < boards {
+            s.terminals.resize(boards, String::new());
+        }
+        for i in 0..boards {
+            let which = match (boards, i, s.second) {
+                (1, _, _) => "The board".to_string(),
+                (_, 0, _) => "Departures".to_string(),
+                (_, _, Direction::Arrival) => "Arrivals".to_string(),
+                (_, _, Direction::Departure) => "The second departures".to_string(),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{which}: "));
+                let t = &mut s.terminals[i];
+                if ui.selectable_label(t.trim().is_empty(), "All").clicked() {
+                    t.clear();
+                }
+                for k in &seen {
+                    let here = normalise::terminal_key(t) == *k;
+                    if ui.selectable_label(here, format!("T{k}")).clicked() {
+                        *t = k.clone();
+                    }
+                }
+                ui.add(
+                    egui::TextEdit::singleline(t)
+                        .hint_text("or type one")
+                        .desired_width(70.0),
+                );
+            });
+        }
+        ui.label(
+            RichText::new(
+                "Terminals offered are the ones in the flights the board has. Flights with no \
+                 terminal given show only on All. One terminal's board leaves the others' flights \
+                 out, so with live flights 2 or 3 pages each update fill it better.",
             )
             .weak(),
         );

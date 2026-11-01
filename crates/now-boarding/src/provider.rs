@@ -42,6 +42,10 @@ pub trait Provider: Send {
 pub struct Answer {
     pub movements: Vec<Movement>,
     pub notices: Vec<String>,
+    /// The place's own time zone and name, when the provider says them:
+    /// for a place the app only knew by its code.
+    pub tz: Option<String>,
+    pub name: Option<String>,
 }
 
 /// A live feed with no key yet: it never reaches the network, and says why
